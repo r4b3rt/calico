@@ -2,14 +2,6 @@ include ../metadata.mk
 
 PACKAGE_NAME = github.com/projectcalico/calico/typha
 
-# Name of the images.
-# e.g., <registry>/<name>:<tag>
-TYPHA_IMAGE    ?=typha
-BUILD_IMAGES   ?=$(TYPHA_IMAGE)
-
-# Add in local static-checks
-LOCAL_CHECKS=check-boring-ssl
-
 ###############################################################################
 # Download and include ../lib.Makefile
 #   Additions to EXTRA_DOCKER_ARGS need to happen before the include since
@@ -17,116 +9,22 @@ LOCAL_CHECKS=check-boring-ssl
 ###############################################################################
 include ../lib.Makefile
 
-###############################################################################
+## SRC_FILES is auto-populated from deps.txt by lib.Makefile.
 
-# Linker flags for building Typha.
-#
-# We use -X to insert the version information into the placeholder variables
-# in the buildinfo package.
-#
-# We use -B to insert a build ID note into the executable, without which, the
-# RPM build tools complain.
-LDFLAGS := -X $(PACKAGE_NAME)/pkg/buildinfo.GitVersion=$(GIT_DESCRIPTION) \
-			-X $(PACKAGE_NAME)/pkg/buildinfo.BuildDate=$(DATE) \
-			-X $(PACKAGE_NAME)/pkg/buildinfo.GitRevision=$(GIT_COMMIT) \
-			-B 0x$(BUILD_ID)
-
-# All Typha go files.
-SRC_FILES:=$(shell find . $(foreach dir,$(NON_TYPHA_DIRS),-path ./$(dir) -prune -o) -type f -name '*.go' -print)
-
-# Touchfile created when we make the typha image.
-TYPHA_CONTAINER_CREATED=.calico_typha.created-$(ARCH)
+BINDIR=./bin
 
 .PHONY: clean
 clean:
-	# Clean .created files which indicate images / releases have been built.
 	find . -name '.*.created*' -type f -delete
 	find . -name '.*.published*' -type f -delete
-	rm -rf .go-pkg-cache \
-		bin \
-		docker-image/bin \
+	rm -rf bin \
 		build \
 		report/*.xml \
-		release-notes-* \
-		.calico_typha.created-*
-	find . -name "*.coverprofile" -type f -delete
+		release-notes-*
+	find . -name "coverprofile.out" -type f -delete
 	find . -name "coverage.xml" -type f -delete
 	find . -name ".coverage" -type f -delete
 	find . -name "*.pyc" -type f -delete
-
-###############################################################################
-# Building the binary
-###############################################################################
-build: bin/calico-typha
-build-all: $(addprefix sub-build-,$(VALIDARCHES))
-sub-build-%:
-	$(MAKE) build ARCH=$*
-
-bin/calico-typha: bin/calico-typha-$(ARCH)
-	ln -f bin/calico-typha-$(ARCH) bin/calico-typha
-
-bin/wrapper: bin/wrapper-$(ARCH)
-	ln -f bin/wrapper-$(ARCH) bin/wrapper
-
-bin/wrapper-$(ARCH): $(SRC_FILES) $(LOCAL_BUILD_DEP)
-ifeq ($(ARCH), amd64)
-	$(call build_static_cgo_boring_binary, ./cmd/wrapper, $@)
-else
-	$(call build_binary, ./cmd/wrapper, $@)
-endif
-
-bin/calico-typha-$(ARCH): $(SRC_FILES)
-ifeq ($(ARCH), amd64)
-	$(call build_static_cgo_boring_binary, ./cmd/calico-typha, $@)
-else
-	$(call build_binary, ./cmd/calico-typha, $@)
-endif
-
-bin/typha-client-$(ARCH): $(SRC_FILES)
-ifeq ($(ARCH), amd64)
-	@echo Building typha client...
-	$(call build_static_cgo_boring_binary, ./cmd/typha-client, $@)
-else
-	$(call build_binary, ./cmd/typha-client, $@)
-endif
-
-###############################################################################
-# Building the image
-###############################################################################
-# Build the calico/typha docker image, which contains only typha.
-.PHONY: $(TYPHA_IMAGE) $(TYPHA_IMAGE)-$(ARCH)
-image: $(BUILD_IMAGES)
-
-# Build the image for the target architecture
-.PHONY: image-all
-image-all: $(addprefix sub-image-,$(VALIDARCHES))
-sub-image-%:
-	$(MAKE) image ARCH=$*
-
-# Build the calico/typha docker image, which contains only Typha.
-.PHONY: image $(TYPHA_IMAGE)
-TYPHA_IMAGE_WITH_TAG=$(TYPHA_IMAGE):latest-$(ARCH)
-TYPHA_IMAGE_ID=$(shell docker images -q $(TYPHA_IMAGE_WITH_TAG))
-
-# This target actually builds the image if any of its dependencies have changed or if it's
-# missing from docker.
-$(TYPHA_CONTAINER_CREATED): bin/calico-typha-$(ARCH) \
-                            LICENSE docker-image/licenses/* \
-                            docker-image/Dockerfile* \
-                            docker-image/nsswitch.conf \
-                            docker-image/typha.cfg \
-                            $(shell test "$(TYPHA_IMAGE_ID)" || echo force-rebuild)
-	$(MAKE) register
-	rm -rf docker-image/bin
-	mkdir -p docker-image/bin
-	cp bin/calico-typha-$(ARCH) docker-image/bin/
-	cp LICENSE docker-image/
-	$(DOCKER_BUILD) -t $(TYPHA_IMAGE_WITH_TAG) --file ./docker-image/Dockerfile.$(ARCH) docker-image --load
-	touch $(TYPHA_CONTAINER_CREATED)
-
-# This target retags the already built image, deferring the build to the target above.
-$(TYPHA_IMAGE): $(TYPHA_CONTAINER_CREATED)
-	$(MAKE) retag-build-images-with-registries VALIDARCHES=$(ARCH) IMAGETAG=latest
 
 ###############################################################################
 # Unit Tests
@@ -136,68 +34,49 @@ ut combined.coverprofile: $(SRC_FILES)
 	@echo Running Go UTs.
 	$(DOCKER_RUN) $(CALICO_BUILD) ./utils/run-coverage
 
-check-boring-ssl: bin/calico-typha-amd64
-	$(DOCKER_RUN) -e CGO_ENABLED=$(CGO_ENABLED) $(CALICO_BUILD) \
-		go tool nm bin/calico-typha-amd64 > bin/tags.txt && grep '_Cfunc__goboringcrypto_' bin/tags.txt 1> /dev/null
-	-rm -f bin/tags.txt
-
 ###############################################################################
 # CI/CD
 ###############################################################################
-.PHONY: cd ci version
-version: image
-	docker run --rm $(TYPHA_IMAGE):latest-$(ARCH) calico-typha --version
+.PHONY: ci ci-no-prereqs version version-no-prereqs fv fv-no-prereqs k8sfv-test k8sfv-test-no-prereqs
 
-ci: mod-download image-all version static-checks ut
+# Uses the combined calico/calico image (loaded from the calico-image prerequisite
+# in CI, or built locally via the marker rule in lib.Makefile). CI invokes the
+# *-no-prereqs targets directly so a missing cached image fails loudly rather
+# than triggering a silent rebuild.
+version: $(REPO_ROOT)/cmd/calico/.image.created-$(ARCH)
+	$(MAKE) version-no-prereqs
+
+version-no-prereqs:
+	docker run --rm calico/calico:latest-$(ARCH) version
+
+ci: mod-download version static-checks ut
 ifeq (,$(filter k8sfv-test, $(EXCEPT)))
 	@$(MAKE) k8sfv-test
 endif
 
-## Deploys images to registry
-cd: cd-common
+# CI entry point: skips the calico image rebuild and runs the full test suite.
+# The image must be preloaded from the GCS cache.
+ci-no-prereqs: mod-download version-no-prereqs static-checks ut
+ifeq (,$(filter k8sfv-test, $(EXCEPT)))
+	@$(MAKE) k8sfv-test-no-prereqs
+endif
 
 fv: k8sfv-test
+fv-no-prereqs: k8sfv-test-no-prereqs
 
-k8sfv-test: image
-	$(MAKE) -C ../felix JUST_A_MINUTE=true USE_TYPHA=true FV_TYPHAIMAGE=$(TYPHA_IMAGE):latest-$(ARCH) TYPHA_VERSION=latest k8sfv-test
+# k8sfv-test runs the combined calico/calico image with `component typha` as the
+# command. The image is loaded from GCS in CI or built locally.
+k8sfv-test: $(REPO_ROOT)/cmd/calico/.image.created-$(ARCH)
+	$(MAKE) k8sfv-test-no-prereqs
+
+k8sfv-test-no-prereqs:
+	$(MAKE) -C ../felix CALICO_IMAGE_DEP= JUST_A_MINUTE=true USE_TYPHA=true \
+		FV_TYPHAIMAGE=calico/calico:latest-$(ARCH) \
+		FV_TYPHACMD="component typha" \
+		TYPHA_VERSION=latest k8sfv-test
 
 st:
 	@echo "No STs available."
-
-###############################################################################
-# Release
-###############################################################################
-## Produces a clean build of release artifacts at the specified version.
-release-build: .release-$(VERSION).created
-.release-$(VERSION).created:
-	$(MAKE) clean image-all RELEASE=true
-	$(MAKE) retag-build-images-with-registries RELEASE=true IMAGETAG=$(VERSION)
-	$(MAKE) retag-build-images-with-registries RELEASE=true IMAGETAG=latest
-	touch $@
-
-## Verifies the release artifacts produces by `make release-build` are correct.
-release-verify: release-prereqs
-	# Check the reported version is correct for each release artifact.
-	docker run --rm $(TYPHA_IMAGE):$(VERSION)-$(ARCH) calico-typha --version | grep $(VERSION) || ( echo "Reported version:" `docker run --rm $(TYPHA_IMAGE):$(VERSION)-$(ARCH) calico-typha --version` "\nExpected version: $(VERSION)" && exit 1 )
-	docker run --rm quay.io/$(TYPHA_IMAGE):$(VERSION)-$(ARCH) calico-typha --version | grep $(VERSION) || ( echo "Reported version:" `docker run --rm quay.io/$(TYPHA_IMAGE):$(VERSION)-$(ARCH) calico-typha --version | grep -x $(VERSION)` "\nExpected version: $(VERSION)" && exit 1 )
-
-	# TODO: Some sort of quick validation of the produced binaries.
-
-## Pushes a github release and release artifacts produced by `make release-build`.
-release-publish: release-prereqs .release-$(VERSION).published
-.release-$(VERSION).published:
-	$(MAKE) push-images-to-registries push-manifests IMAGETAG=$(VERSION) RELEASE=$(RELEASE) CONFIRM=$(CONFIRM)
-	touch $@
-
-# WARNING: Only run this target if this release is the latest stable release. Do NOT
-# run this target for alpha / beta / release candidate builds, or patches to earlier Calico versions.
-## Pushes `latest` release images. WARNING: Only run this for latest stable releases.
-release-publish-latest: release-prereqs
-	# Check latest versions match.
-	if ! docker run $(TYPHA_IMAGE):latest-$(ARCH) calico-typha --version | grep '$(VERSION)'; then echo "Reported version:" `docker run $(TYPHA_IMAGE):latest-$(ARCH) calico-typha --version` "\nExpected version: $(VERSION)"; false; else echo "\nVersion check passed\n"; fi
-	if ! docker run quay.io/$(TYPHA_IMAGE):latest-$(ARCH) calico-typha --version | grep '$(VERSION)'; then echo "Reported version:" `docker run quay.io/$(TYPHA_IMAGE):latest-$(ARCH) calico-typha --version` "\nExpected version: $(VERSION)"; false; else echo "\nVersion check passed\n"; fi
-
-	$(MAKE) push-images-to-registries push-manifests IMAGETAG=latest RELEASE=$(RELEASE) CONFIRM=$(CONFIRM)
 
 ###############################################################################
 # Developer helper scripts (not used by build or test)
@@ -234,11 +113,3 @@ cover-report: combined.coverprofile
 				   sed 's=$(PACKAGE_NAME)/==' | \
 				   column -t | \
 				   grep -v '100\.0%'"
-
-bin/calico-typha.transfer-url: bin/calico-typha-$(ARCH)
-	$(DOCKER_RUN) $(CALICO_BUILD) sh -c 'curl --upload-file bin/calico-typha-$(ARCH) https://transfer.sh/calico-typha > $@'
-
-# Install or update the tools used by the build
-.PHONY: update-tools
-update-tools:
-	go get -u github.com/onsi/ginkgo/ginkgo

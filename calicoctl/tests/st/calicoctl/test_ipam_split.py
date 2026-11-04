@@ -15,8 +15,6 @@ import logging
 import copy
 import os
 
-from nose_parameterized import parameterized
-
 from tests.st.test_base import TestBase
 from tests.st.utils.utils import log_and_run, calicoctl, \
     API_VERSION, name, namespace, ERROR_CONFLICT, NOT_FOUND, NOT_NAMESPACED, \
@@ -65,7 +63,7 @@ class TestCalicoctlIPAMSplit(TestBase):
         rc = calicoctl("datastore migrate lock")
         rc.assert_no_error()
 
-        # Attempt to split a non-existent IP pool
+        # Attempt to split a nonexistent IP pool
         rc = calicoctl("ipam split --cidr=10.0.2.0/24 4")
         rc.assert_error(text=POOL_NOT_EXIST_CIDR)
 
@@ -148,7 +146,7 @@ class TestCalicoctlIPAMSplit(TestBase):
         rc = calicoctl("datastore migrate lock")
         rc.assert_no_error()
 
-        # Attempt to split a non-existent IP pool
+        # Attempt to split a nonexistent IP pool
         rc = calicoctl("ipam split --name=%s 4" % name(ippool_name2_rev1_v6))
         rc.assert_error(text=POOL_NOT_EXIST_CIDR)
 

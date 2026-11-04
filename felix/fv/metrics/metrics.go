@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,12 @@ package metrics
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -42,7 +44,7 @@ func PortString() string {
 	return strconv.Itoa(Port)
 }
 
-func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (metric string, err error) {
+func GetRawMetrics(ip string, port int, caFile, certFile, keyFile string) (out string, err error) {
 	httpClient := http.Client{Timeout: time.Second}
 	defer httpClient.CloseIdleConnections()
 	method := "http"
@@ -86,7 +88,7 @@ func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (met
 			ok := transport.TLSClientConfig.RootCAs.AppendCertsFromPEM(caPEMBlock)
 			if !ok {
 				log.Error("Failed to add CA data to pool")
-				return "", errors.New("Failed to add CA data to pool")
+				return "", errors.New("failed to add CA data to pool")
 			}
 			transport.TLSClientConfig.VerifyPeerCertificate = tlsutils.CertificateVerifier(
 				log.WithField("caFile", caFile),
@@ -104,7 +106,7 @@ func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (met
 		httpClient.Transport = &http.Transport{}
 	}
 	var resp *http.Response
-	resp, err = httpClient.Get(fmt.Sprintf("%v://%v:%v/metrics", method, ip, port))
+	resp, err = httpClient.Get(fmt.Sprintf("%s://%s/metrics", method, net.JoinHostPort(ip, strconv.Itoa(port))))
 	if err != nil {
 		return
 	}
@@ -112,21 +114,38 @@ func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (met
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		err = fmt.Errorf("Bad response (%v) from metrics server", resp.StatusCode)
+		err = fmt.Errorf("bad response (%v) from metrics server", resp.StatusCode)
 		return
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
+	all, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(all), nil
+}
+
+func GetMetric(ip string, port int, name, caFile, certFile, keyFile string) (metric string, err error) {
+	metrics, err := GetRawMetrics(ip, port, caFile, certFile, keyFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to load metrics: %w", err)
+	}
+	scanner := bufio.NewScanner(bytes.NewBufferString(metrics))
+	found := false
 	for scanner.Scan() {
 		line := scanner.Text()
 		log.WithField("line", line).Debug("Line")
 		if strings.HasPrefix(line, name) {
 			log.WithField("line", line).Info("Line")
 			metric = strings.TrimSpace(strings.TrimPrefix(line, name))
+			found = true
 			break
 		}
 	}
 	err = scanner.Err()
+	if !found {
+		return "", fmt.Errorf("metric %q not found in\n%s", name, metrics)
+	}
 	return
 }
 
@@ -141,6 +160,12 @@ func GetFelixMetricInt(felixIP, name string) (metric int, err error) {
 		return 0, err
 	}
 	return strconv.Atoi(s)
+}
+
+func GetFelixMetricIntFn(felixIP, name string) func() (metric int, err error) {
+	return func() (metric int, err error) {
+		return GetFelixMetricInt(felixIP, name)
+	}
 }
 
 func GetFelixMetricFloat(felixIP, name string) (metric float64, err error) {

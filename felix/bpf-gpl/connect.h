@@ -2,15 +2,22 @@
 // Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 
-#ifndef __CONNECT_H__
-#define __CONNECT_H__
+#ifndef __CALI_CONNECT_H__
+#define __CALI_CONNECT_H__
 
 #include <linux/bpf.h>
+#include <linux/in.h>
 
-#include "bpf.h"
+#include "cali_bpf.h"
+#include "ctlb.h"
+#include "ip_addr.h"
+#include "log.h"
 #include "nat_lookup.h"
+#include "nat_types.h"
+#include "sendrecv.h"
+#include "sock_type.h"
 
-static CALI_BPF_INLINE int do_nat_common(struct bpf_sock_addr *ctx, __u8 proto, __be32 *dst, bool connect)
+static CALI_BPF_INLINE int do_nat_common(struct bpf_sock_addr *ctx, __u8 proto, ipv46_addr_t *dst, bool connect)
 {
 	int err = 0;
 	/* We do not know what the source address is yet, we only know that it
@@ -24,11 +31,12 @@ static CALI_BPF_INLINE int do_nat_common(struct bpf_sock_addr *ctx, __u8 proto, 
 	nat_lookup_result res = NAT_LOOKUP_ALLOW;
 	__u16 dport_he = (__u16)(bpf_ntohl(ctx->user_port)>>16);
 	struct calico_nat_dest *nat_dest;
-	nat_dest = calico_v4_nat_lookup(0, *dst, proto, dport_he, false, &res,
+	ipv46_addr_t voidip = VOID_IP;
+	nat_dest = calico_nat_lookup(&voidip, dst, proto, dport_he, false, &res,
 			proto == IPPROTO_UDP && !connect ? CTLB_UDP_NOT_SEEN_TIMEO : 0, /* enforce affinity UDP */
 			proto == IPPROTO_UDP && !connect /* update affinity timer */);
 	if (!nat_dest) {
-		CALI_INFO("NAT miss.\n");
+		CALI_INFO("NAT miss.");
 		if (res == NAT_NO_BACKEND) {
 			err = -1;
 		}
@@ -38,8 +46,8 @@ static CALI_BPF_INLINE int do_nat_common(struct bpf_sock_addr *ctx, __u8 proto, 
 	__be32 dport_be = host_to_ctx_port(nat_dest->port);
 
 	__u64 cookie = bpf_get_socket_cookie(ctx);
-	CALI_DEBUG("Store: ip=%x port=%d cookie=%x\n",
-			bpf_ntohl(nat_dest->addr), bpf_ntohs((__u16)dport_be), cookie);
+	CALI_DEBUG("Store: ip=%x port=%d cookie=%x",
+			debug_ip(nat_dest->addr), bpf_ntohs((__u16)dport_be), cookie);
 
 	/* For all protocols, record recent NAT operations in an LRU map; other BPF programs use this
 	 * cache to reverse our DNAT so they can do pre-DNAT policy. */
@@ -49,31 +57,31 @@ static CALI_BPF_INLINE int do_nat_common(struct bpf_sock_addr *ctx, __u8 proto, 
 		.port = dport_be,
 		.proto = proto,
 	};
-	struct sendrecv4_val val = {
+	struct sendrec_val val = {
 		.ip	= *dst,
 		.port	= ctx->user_port,
 	};
-	int rc = cali_v4_ct_nats_update_elem(&natk, &val, 0);
+	int rc = cali_ct_nats_update_elem(&natk, &val, 0);
 	if (rc) {
 		/* if this happens things are really bad! report */
-		CALI_INFO("Failed to update ct_nats map rc=%d\n", rc);
+		CALI_INFO("Failed to update ct_nats map rc=%d", rc);
 	}
 
 	if (proto != IPPROTO_TCP) {
 		/* For UDP, store a long-lived reverse mapping, which we use to reverse the DNAT for programs that
 		 * check the source on the return packets. */
 		__u64 cookie = bpf_get_socket_cookie(ctx);
-		CALI_DEBUG("Store: ip=%x port=%d cookie=%x\n",
-				bpf_ntohl(nat_dest->addr), bpf_ntohs((__u16)dport_be), cookie);
-		struct sendrecv4_key key = {
+		CALI_DEBUG("Store: ip=%x port=%d cookie=%x",
+				debug_ip(nat_dest->addr), bpf_ntohs((__u16)dport_be), cookie);
+		struct sendrec_key key = {
 			.ip	= nat_dest->addr,
 			.port	= dport_be,
 			.cookie	= cookie,
 		};
 
-		if (cali_v4_srmsg_update_elem(&key, &val, 0)) {
+		if (cali_srmsg_update_elem(&key, &val, 0)) {
 			/* if this happens things are really bad! report */
-			CALI_INFO("Failed to update map\n");
+			CALI_INFO("Failed to update map");
 			goto out;
 		}
 	}
@@ -85,7 +93,7 @@ out:
 	return err;
 }
 
-static CALI_BPF_INLINE int connect_v4(struct bpf_sock_addr *ctx, __be32 *dst)
+static CALI_BPF_INLINE int do_connect(struct bpf_sock_addr *ctx, ipv46_addr_t *dst)
 {
 	int ret = 1; /* OK value */
 
@@ -93,25 +101,25 @@ static CALI_BPF_INLINE int connect_v4(struct bpf_sock_addr *ctx, __be32 *dst)
 	 * dealt with somewhere else.
 	 */
 	if (ctx->type != SOCK_STREAM && ctx->type != SOCK_DGRAM) {
-		CALI_INFO("unexpected sock type %d\n", ctx->type);
+		CALI_INFO("unexpected sock type %d", ctx->type);
 		goto out;
 	}
 
 	__u8 ip_proto;
 	switch (ctx->type) {
 	case SOCK_STREAM:
-		CALI_DEBUG("SOCK_STREAM -> assuming TCP\n");
+		CALI_DEBUG("SOCK_STREAM -> assuming TCP");
 		ip_proto = IPPROTO_TCP;
 		break;
 	case SOCK_DGRAM:
 		if (CTLB_EXCLUDE_UDP) {
 			goto out;
 		}
-		CALI_DEBUG("SOCK_DGRAM -> assuming UDP\n");
+		CALI_DEBUG("SOCK_DGRAM -> assuming UDP");
 		ip_proto = IPPROTO_UDP;
 		break;
 	default:
-		CALI_DEBUG("Unknown socket type: %d\n", (int)ctx->type);
+		CALI_DEBUG("Unknown socket type: %d", (int)ctx->type);
 		goto out;
 	}
 
@@ -124,4 +132,4 @@ out:
 	return ret;
 }
 
-#endif /* __CONNECT_H__ */
+#endif /* __CALI_CONNECT_H__ */

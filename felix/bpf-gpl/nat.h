@@ -1,185 +1,60 @@
 // Project Calico BPF dataplane programs.
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 
 #ifndef __CALI_NAT_H__
 #define __CALI_NAT_H__
 
-#include <stddef.h>
-
 #include <linux/if_ether.h>
-#include <linux/udp.h>
+#include <linux/in.h>
 
-#include "bpf.h"
-#include "skb.h"
-#include "routes.h"
+#include "arp.h"
+#include "cali_bpf.h"
+#include "counters.h"
+#include "globals.h"
+#include "ip_addr.h"
+#include "log.h"
 #include "nat_types.h"
-
-#ifndef CALI_VXLAN_VNI
-#define CALI_VXLAN_VNI 0xca11c0
+#include "reasons.h"
+#include "routes.h"
+#include "skb.h"
+#include "types.h"
+#ifdef IPVER6
+#include "nat6.h"
+#else
+#include "nat4.h"
 #endif
 
-#define dnat_should_encap() (CALI_F_FROM_HEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV && !CALI_F_NAT_IF)
-#define dnat_return_should_encap() (CALI_F_FROM_WEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV && !CALI_F_NAT_IF)
-#define dnat_should_decap() (CALI_F_FROM_HEP && !CALI_F_TUNNEL && !CALI_F_L3_DEV && !CALI_F_NAT_IF)
+/* An encapsulating device never adds another layer of its own. */
+#define dnat_on_plain_dev() (!CALI_F_L3_DEV && !CALI_F_NAT_IF && !IFACE_ENCAPS)
 
-/* Number of bytes we add to a packet when we do encap. */
-#define VXLAN_ENCAP_SIZE	(sizeof(struct ethhdr) + sizeof(struct iphdr) + \
-				sizeof(struct udphdr) + sizeof(struct vxlanhdr))
+#define dnat_should_encap() (CALI_F_FROM_HEP && dnat_on_plain_dev())
+#define dnat_return_should_encap() (CALI_F_FROM_WEP && dnat_on_plain_dev())
+#define dnat_should_decap() (CALI_F_FROM_HEP && dnat_on_plain_dev())
 
-static CALI_BPF_INLINE int skb_nat_l4_csum_ipv4(struct cali_tc_ctx *ctx, size_t off,
-						__be32 ip_src_from, __be32 ip_src_to,
-						__be32 ip_dst_from, __be32 ip_dst_to,
-						__u16 dport_from, __u16 dport_to,
-						__u16 sport_from, __u16 sport_to,
-						__u64 flags)
+static CALI_BPF_INLINE __u16 vxlan_select_src_port(struct cali_tc_ctx *ctx)
 {
-	int ret = 0;
-	struct __sk_buff *skb = ctx->skb;
-
-	if (ip_src_from != ip_src_to) {
-		CALI_DEBUG("L4 checksum update src IP from %x to %x\n",
-				bpf_ntohl(ip_src_from), bpf_ntohl(ip_src_to));
-		ret = bpf_l4_csum_replace(skb, off, ip_src_from, ip_src_to, flags | BPF_F_PSEUDO_HDR | 4);
-		CALI_DEBUG("bpf_l4_csum_replace(IP): %d\n", ret);
-	}
-	if (ip_dst_from != ip_dst_to) {
-		CALI_DEBUG("L4 checksum update dst IP from %x to %x\n",
-				bpf_ntohl(ip_dst_from), bpf_ntohl(ip_dst_to));
-		ret = bpf_l4_csum_replace(skb, off, ip_dst_from, ip_dst_to, flags | BPF_F_PSEUDO_HDR | 4);
-		CALI_DEBUG("bpf_l4_csum_replace(IP): %d\n", ret);
-	}
-	if (sport_from != sport_to) {
-		CALI_DEBUG("L4 checksum update sport from %d to %d\n",
-				bpf_ntohs(sport_from), bpf_ntohs(sport_to));
-		int rc = bpf_l4_csum_replace(skb, off, sport_from, sport_to, flags | 2);
-		CALI_DEBUG("bpf_l4_csum_replace(sport): %d\n", rc);
-		ret |= rc;
-	}
-	if (dport_from != dport_to) {
-		CALI_DEBUG("L4 checksum update dport from %d to %d\n",
-				bpf_ntohs(dport_from), bpf_ntohs(dport_to));
-		int rc = bpf_l4_csum_replace(skb, off, dport_from, dport_to, flags | 2);
-		CALI_DEBUG("bpf_l4_csum_replace(dport): %d\n", rc);
-		ret |= rc;
-	}
-
-	return ret;
-}
-
-static CALI_BPF_INLINE int vxlan_v4_encap(struct cali_tc_ctx *ctx,  __be32 ip_src, __be32 ip_dst)
-{
-	int ret;
-	__wsum csum;
-
-	__u32 new_hdrsz = sizeof(struct ethhdr) + sizeof(struct iphdr) +
-			sizeof(struct udphdr) + sizeof(struct vxlanhdr);
-
-	ret = bpf_skb_adjust_room(ctx->skb, new_hdrsz, BPF_ADJ_ROOM_MAC,
-						  BPF_F_ADJ_ROOM_ENCAP_L4_UDP |
-						  BPF_F_ADJ_ROOM_ENCAP_L3_IPV4 |
-						  BPF_F_ADJ_ROOM_ENCAP_L2(sizeof(struct ethhdr)));
-
-	if (ret) {
-		goto out;
-	}
-
-	ret = -1;
-
-	if (skb_refresh_validate_ptrs(ctx, new_hdrsz)) {
-		deny_reason(ctx, CALI_REASON_SHORT);
-		CALI_DEBUG("Too short VXLAN encap\n");
-		goto out;
-	}
-
-	// Note: assuming L2 packet here so this code can't be used on an L3 device.
-	struct vxlanhdr *vxlan = (void *)(udp_hdr(ctx) + 1);
-	struct ethhdr *eth_inner = (void *)(vxlan+1);
-	struct iphdr *ip_inner = (void*)(eth_inner+1);
-
-	/* Copy the original IP header. Since it is already DNATed, the dest IP is
-	 * already set. All we need to do is to change the source IP
+	/* Keep the hash stable for each flow direction. ICMP has no ports, but
+	 * does not require ordering with the related flow.
 	 */
-	*ip_hdr(ctx) = *ip_inner;
+	__u16 port = STATE->sport ^ STATE->dport;
 
-	/* decrement TTL for the inner IP header. TTL must be > 1 to get here */
-	ip_dec_ttl(ip_inner);
+	if (VXLAN_SRC_PORT_MIN != 0 && VXLAN_SRC_PORT_MAX != 0) {
+		/* Include the upper bound, as the kernel VXLAN device does. */
+		__u16 range = (__u16)(VXLAN_SRC_PORT_MAX - VXLAN_SRC_PORT_MIN) + 1;
+		port = VXLAN_SRC_PORT_MIN + (port % range);
+	}
 
-	ip_hdr(ctx)->saddr = ip_src;
-	ip_hdr(ctx)->daddr = ip_dst;
-	ip_hdr(ctx)->tot_len = bpf_htons(bpf_ntohs(ip_hdr(ctx)->tot_len) + new_hdrsz);
-	ip_hdr(ctx)->ihl = 5; /* in case there were options in ip_inner */
-	ip_hdr(ctx)->check = 0;
-	ip_hdr(ctx)->protocol = IPPROTO_UDP;
-
-	udp_hdr(ctx)->source = udp_hdr(ctx)->dest = bpf_htons(VXLAN_PORT);
-	udp_hdr(ctx)->len = bpf_htons(bpf_ntohs(ip_hdr(ctx)->tot_len) - sizeof(struct iphdr));
-
-	*((__u8*)&vxlan->flags) = 1 << 3; /* set the I flag to make the VNI valid */
-	vxlan->vni = bpf_htonl(CALI_VXLAN_VNI) >> 8; /* it is actually 24-bit, last 8 reserved */
-
-	/* keep eth_inner MACs zeroed, it is useless after decap */
-	eth_inner->h_proto = eth_hdr(ctx)->h_proto;
-
-	CALI_DEBUG("vxlan encap %x : %x\n", bpf_ntohl(ip_hdr(ctx)->saddr), bpf_ntohl(ip_hdr(ctx)->daddr));
-
-	/* change the checksums last to avoid pointer access revalidation */
-
-	csum = bpf_csum_diff(0, 0, ctx->ip_header, sizeof(struct iphdr), 0);
-	ret = bpf_l3_csum_replace(ctx->skb, ((long) ctx->ip_header) - ((long) skb_start_ptr(ctx->skb)) +
-				  offsetof(struct iphdr, check), 0, csum, 0);
-
-out:
-	return ret;
+	return port;
 }
 
-static CALI_BPF_INLINE int vxlan_v4_decap(struct __sk_buff *skb)
+static CALI_BPF_INLINE int is_vxlan_tunnel(struct cali_tc_ctx *ctx, __u16 vxlanport)
 {
-	__u32 extra_hdrsz;
-	int ret = -1;
-
-	extra_hdrsz = sizeof(struct ethhdr) + sizeof(struct iphdr) +
-		sizeof(struct udphdr) + sizeof(struct vxlanhdr);
-
-	ret = bpf_skb_adjust_room(skb, -extra_hdrsz, BPF_ADJ_ROOM_MAC | BPF_F_ADJ_ROOM_FIXED_GSO, 0);
-
-	return ret;
+	return ctx->state->ip_proto == IPPROTO_UDP &&
+		ctx->state->dport == vxlanport;
 }
 
-static CALI_BPF_INLINE int is_vxlan_tunnel(struct iphdr *ip, __u16 vxlanport)
-{
-	struct udphdr *udp = (struct udphdr *)(ip +1);
-
-	return ip->protocol == IPPROTO_UDP &&
-		udp->dest == bpf_htons(vxlanport);
-}
-
-static CALI_BPF_INLINE bool vxlan_size_ok(struct cali_tc_ctx *ctx)
-{
-	return !skb_refresh_validate_ptrs(ctx, UDP_SIZE + sizeof(struct vxlanhdr));
-}
-
-static CALI_BPF_INLINE __u32 vxlan_vni(struct cali_tc_ctx *ctx)
-{
-	struct vxlanhdr *vxlan;
-
-	vxlan = skb_ptr_after(skb, udp_hdr(ctx));
-
-	return bpf_ntohl(vxlan->vni << 8); /* 24-bit field, last 8 reserved */
-}
-
-static CALI_BPF_INLINE bool vxlan_vni_is_valid(struct cali_tc_ctx *ctx)
-{
-	struct vxlanhdr *vxlan;
-
-	vxlan = skb_ptr_after(ctx->skb, udp_hdr(ctx));
-
-	return *((__u8*)&vxlan->flags) & (1 << 3);
-}
-
-#define vxlan_udp_csum_ok(udp) ((udp)->check == 0)
-
-static CALI_BPF_INLINE bool vxlan_v4_encap_too_big(struct cali_tc_ctx *ctx)
+static CALI_BPF_INLINE bool vxlan_encap_too_big(struct cali_tc_ctx *ctx)
 {
 	__u32 mtu = TUNNEL_MTU;
 
@@ -189,10 +64,115 @@ static CALI_BPF_INLINE bool vxlan_v4_encap_too_big(struct cali_tc_ctx *ctx)
 	 * IP data, and does not include any lower-level headers.
 	 */
 	if (ctx->skb->len > sizeof(struct ethhdr) + mtu) {
-		CALI_DEBUG("SKB too long (len=%d) vs limit=%d\n", ctx->skb->len, mtu);
+		CALI_DEBUG("SKB too long (len=%d) vs limit=%d", ctx->skb->len, mtu);
 		return true;
 	}
 	return false;
+}
+
+#define EFAULT	14
+
+static CALI_BPF_INLINE int skb_nat_l4_csum(struct cali_tc_ctx *ctx, size_t off,
+					   ipv46_addr_t ip_src_from, ipv46_addr_t ip_src_to,
+					   ipv46_addr_t ip_dst_from, ipv46_addr_t ip_dst_to,
+					   __u16 dport_from, __u16 dport_to,
+					   __u16 sport_from, __u16 sport_to,
+					   __u64 flags,
+					   bool inner_icmp)
+{
+	int ret = 0;
+	struct __sk_buff *skb = ctx->skb;
+
+	if (!inner_icmp) {
+		/* Write back L4 header. */
+		if (ctx->ipheader_len == IP_SIZE) {
+			if (ctx->state->ip_proto == IPPROTO_TCP) {
+				if (skb_refresh_validate_ptrs(ctx, TCP_SIZE)) {
+					deny_reason(ctx, CALI_REASON_SHORT);
+					CALI_DEBUG("Too short");
+					return -EFAULT;
+				}
+				__builtin_memcpy(((void*)ip_hdr(ctx))+IP_SIZE, ctx->scratch->l4, TCP_SIZE);
+			} else {
+				if (skb_refresh_validate_ptrs(ctx, UDP_SIZE)) {
+					deny_reason(ctx, CALI_REASON_SHORT);
+					CALI_DEBUG("Too short");
+					return -EFAULT;
+				}
+				__builtin_memcpy(((void*)ip_hdr(ctx))+IP_SIZE, ctx->scratch->l4, UDP_SIZE);
+			}
+		} else {
+			int size = l4_hdr_len(ctx);
+			int offset = skb_l4hdr_offset(ctx);
+
+			if (size == 0) {
+				CALI_DEBUG("Bad L4 proto");
+				return -EFAULT;
+			}
+			if (bpf_skb_store_bytes(ctx->skb, offset, ctx->scratch->l4, size, 0)) {
+				CALI_DEBUG("Too short");
+				return -EFAULT;
+			}
+		}
+	}
+
+	/* We start with csum == 0 (seed for the first diff) as we are calculating just
+	 * the diff between 2 IPs. We then feed the result as a seed to the next diff if
+	 * we need to as a carry-over.
+	 *
+	 * We must use diff because the replace functions cannot calculate a diff for 16
+	 * byte ipv6 addresses in one go. And this keeps the code the same for v4/6 with
+	 * minimal impact on v4.
+	 */
+	__wsum csum = 0;
+
+	bool csum_update = false;
+
+	if (!ip_equal(ip_src_from, ip_src_to)) {
+		CALI_DEBUG("L4 checksum update src IP from " IP_FMT " to " IP_FMT "",
+				debug_ip(ip_src_from), debug_ip(ip_src_to));
+
+		csum = bpf_csum_diff((__u32*)&ip_src_from, sizeof(ip_src_from), (__u32*)&ip_src_to, sizeof(ip_src_to), csum);
+		CALI_DEBUG("bpf_l4_csum_diff(IP): 0x%x", csum);
+		csum_update = true;
+	}
+	if (!ip_equal(ip_dst_from, ip_dst_to)) {
+		CALI_DEBUG("L4 checksum update dst IP from " IP_FMT " to " IP_FMT "",
+				debug_ip(ip_dst_from), debug_ip(ip_dst_to));
+		csum = bpf_csum_diff((__u32*)&ip_dst_from, sizeof(ip_dst_from), (__u32*)&ip_dst_to, sizeof(ip_dst_to), csum);
+		CALI_DEBUG("bpf_l4_csum_diff(IP): 0x%x", csum);
+		csum_update = true;
+	}
+
+	/* If the IPs have changed we must replace it as part of the pseudo header that is
+	 * used to calculate L4 csum.
+	 *
+	 * If we are fixing inner ICMP payload, we do not change L4 csum for the payload
+	 * (no need for that, it is just a fraction of the packet), but the L4 here is the
+	 * ICMP itself since its payload has changed. ICMPv4 does not include the pseudo
+	 * header in the csum and v6 had it already fixed when we modified the outer IP.
+	 */
+	if (csum_update) {
+		ret = bpf_l4_csum_replace(skb, off, 0, csum, flags | (inner_icmp ? 0 : BPF_F_PSEUDO_HDR));
+	}
+
+	/* We can use replace for ports in both v4/6 as they are the same size of 2 bytes. */
+	if (sport_from != sport_to) {
+		CALI_DEBUG("L4 checksum update sport from %d to %d",
+				bpf_ntohs(sport_from), bpf_ntohs(sport_to));
+		int rc = bpf_l4_csum_replace(skb, off, sport_from, sport_to, flags | 2);
+		CALI_DEBUG("bpf_l4_csum_replace(sport): %d", rc);
+		ret |= rc;
+	}
+	if (dport_from != dport_to) {
+		CALI_DEBUG("L4 checksum update dport from %d to %d",
+				bpf_ntohs(dport_from), bpf_ntohs(dport_to));
+		int rc = bpf_l4_csum_replace(skb, off, dport_from, dport_to, flags | 2);
+		CALI_DEBUG("bpf_l4_csum_replace(dport): %d", rc);
+		ret |= rc;
+	}
+
+	return ret;
 }
 
 /* vxlan_attempt_decap tries to decode the packet as VXLAN and, if it is a BPF-to-BPF
@@ -202,69 +182,87 @@ static CALI_BPF_INLINE bool vxlan_v4_encap_too_big(struct cali_tc_ctx *ctx)
  * -1: if the packet was invalid (e.g. too short)
  * -2: if the packet is VXLAN from a Calico host, to this node, but it is not the right VNI.
  */
-static CALI_BPF_INLINE int vxlan_attempt_decap(struct cali_tc_ctx *ctx) {
+static CALI_BPF_INLINE int vxlan_attempt_decap(struct cali_tc_ctx *ctx)
+{
 	/* decap on host ep only if directly for the node */
-	CALI_DEBUG("VXLAN tunnel packet to %x (host IP=%x)\n",
-		bpf_ntohl(ip_hdr(ctx)->daddr),
-		bpf_ntohl(HOST_IP));
+	CALI_DEBUG("VXLAN tunnel packet to " IP_FMT " (host IP=" IP_FMT ")",
+		&ip_hdr(ctx)->daddr, debug_ip(HOST_IP));
 
-	if (!rt_addr_is_local_host(ip_hdr(ctx)->daddr)) {
+	if (!rt_addr_is_local_host((ipv46_addr_t *)&ip_hdr(ctx)->daddr)) {
 		goto fall_through;
 	}
 	if (!vxlan_size_ok(ctx)) {
 		/* UDP header said VXLAN but packet wasn't long enough. */
 		deny_reason(ctx, CALI_REASON_SHORT);
-		CALI_DEBUG("Too short\n");
+		CALI_DEBUG("Too short");
 		goto deny;
 	}
 	if (!vxlan_vni_is_valid(ctx) ) {
+		CALI_DEBUG("VXLAN: Invalid VNI");
 		goto fall_through;
 	}
-	if (vxlan_vni(ctx) != CALI_VXLAN_VNI) {
-		if (rt_addr_is_remote_host(ip_hdr(ctx)->saddr)) {
+	if (vxlan_vni(ctx) == OVERLAY_TUNNEL_ID) {
+		if (rt_addr_is_remote_host((ipv46_addr_t *)&ip_hdr(ctx)->saddr)) {
 			/* Not BPF-generated VXLAN packet but it was from a Calico host to this node. */
+			CALI_DEBUG("VXLAN: non-tunnel calico");
 			goto auto_allow;
 		}
+		/* Our VNI, but not from a Calico host. Fall through to policy. */
+		CALI_DEBUG("VXLAN with our VNI (0x%x) from non-calico source.", vxlan_vni(ctx));
+		/* N.B. we defer dropping to policy */
+		goto fall_through;
+	} else if (vxlan_vni(ctx) == CALI_VXLAN_VNI) {
+		if (!rt_addr_is_remote_host((ipv46_addr_t *)&ip_hdr(ctx)->saddr)) {
+			CALI_DEBUG("VXLAN with our VNI (0x%x) from unexpected source.", vxlan_vni(ctx));
+			deny_reason(ctx, CALI_REASON_UNAUTH_SOURCE);
+			goto deny;
+		}
+		if (!vxlan_udp_csum_ok(udp_hdr(ctx))) {
+			/* Our VNI but checksum is incorrect (we always use check=0). */
+			CALI_DEBUG("VXLAN with our VNI but incorrect checksum.");
+			deny_reason(ctx, CALI_REASON_UNAUTH_SOURCE);
+			goto deny;
+		}
+	} else {
 		/* Not our VNI, not from Calico host. Fall through to policy. */
+		CALI_DEBUG("VXLAN: Not our VNI 0x%x", vxlan_vni(ctx));
 		goto fall_through;
 	}
-	if (!rt_addr_is_remote_host(ip_hdr(ctx)->saddr)) {
-		CALI_DEBUG("VXLAN with our VNI from unexpected source.\n");
-		deny_reason(ctx, CALI_REASON_UNAUTH_SOURCE);
-		goto deny;
-	}
-	if (!vxlan_udp_csum_ok(udp_hdr(ctx))) {
-		/* Our VNI but checksum is incorrect (we always use check=0). */
-		CALI_DEBUG("VXLAN with our VNI but incorrect checksum.\n");
-		deny_reason(ctx, CALI_REASON_UNAUTH_SOURCE);
-		goto deny;
-	}
-
-	ctx->arpk.ip = ip_hdr(ctx)->saddr;
-	ctx->arpk.ifindex = ctx->skb->ifindex;
 
 	/* We update the map straight with the packet data, eth header is
 	 * dst:src but the value is src:dst so it flips it automatically
 	 * when we use it on xmit.
 	 */
-	cali_v4_arp_update_elem(&ctx->arpk, eth_hdr(ctx), 0);
-	CALI_DEBUG("ARP update for ifindex %d ip %x\n", ctx->arpk.ifindex, bpf_ntohl(ctx->arpk.ip));
+	struct arp_key arpk = {
+		.ifindex = ctx->skb->ifindex,
+	};
+#ifdef IPVER6
+	ipv6hdr_ip_to_ipv6_addr_t(&arpk.ip, &ip_hdr(ctx)->saddr);
+#else
+	arpk.ip = ip_hdr(ctx)->saddr;
+#endif
+	cali_arp_update_elem(&arpk, eth_hdr(ctx), 0);
+	CALI_DEBUG("ARP update for ifindex %d ip " IP_FMT "", arpk.ifindex, debug_ip(arpk.ip));
 
+#ifdef IPVER6
+	ipv6hdr_ip_to_ipv6_addr_t(&ctx->state->tun_ip, &ip_hdr(ctx)->saddr);
+#else
 	ctx->state->tun_ip = ip_hdr(ctx)->saddr;
-	CALI_DEBUG("vxlan decap\n");
-	if (vxlan_v4_decap(ctx->skb)) {
+#endif
+	CALI_DEBUG("vxlan decap");
+	if (vxlan_decap(ctx->skb)) {
 		deny_reason(ctx, CALI_REASON_DECAP_FAIL);
 		goto deny;
 	}
 
 	/* Revalidate the packet after the decap. */
-	if (skb_refresh_validate_ptrs(ctx, UDP_SIZE)) {
+	if (skb_refresh_validate_ptrs_l4(ctx)) {
 		deny_reason(ctx, CALI_REASON_SHORT);
-		CALI_DEBUG("Too short\n");
+		CALI_DEBUG("Too short");
 		goto deny;
 	}
 
-	CALI_DEBUG("vxlan decap origin %x\n", bpf_ntohl(ctx->state->tun_ip));
+	CALI_DEBUG("vxlan decap origin " IP_FMT "", debug_ip(ctx->state->tun_ip));
 
 fall_through:
 	return 0;
@@ -273,8 +271,9 @@ auto_allow:
 	return -2;
 
 deny:
-	ctx->fwd.res = TC_ACT_SHOT;
+	ctx->state->fwd.res = TC_ACT_SHOT;
 	return -1;
 }
+
 
 #endif /* __CALI_NAT_H__ */

@@ -89,11 +89,9 @@ func convertWatchEvent(e *clientv3.Event, l model.ListInterface) (*api.WatchEven
 	}, nil
 }
 
-var (
-	ErrMissingValue = fmt.Errorf("missing etcd KV")
-)
+var ErrMissingValue = fmt.Errorf("missing etcd KV")
 
-// etcdToKVPair converts an etcd KeyValue in to model.KVPair.
+// etcdToKVPair converts an etcd KeyValue into model.KVPair.
 func etcdToKVPair(key model.Key, ekv *mvccpb.KeyValue) (*model.KVPair, error) {
 	if ekv == nil {
 		return nil, ErrMissingValue
@@ -113,9 +111,13 @@ func etcdToKVPair(key model.Key, ekv *mvccpb.KeyValue) (*model.KVPair, error) {
 		}
 	}
 
-	return &model.KVPair{
+	kvp := &model.KVPair{
 		Key:      key,
 		Value:    v,
 		Revision: strconv.FormatInt(ekv.ModRevision, 10),
-	}, nil
+	}
+	if err = prepForReturn(kvp); err != nil {
+		return nil, err
+	}
+	return kvp, nil
 }

@@ -148,7 +148,7 @@ func (m *networkMigrator) setupCalicoNetworkForNode(node *v1.Node) error {
 	}
 
 	// Cordon and Drain node. Make sure no pod (except daemonset pod or pod with nodeName selector) can run on this node.
-	err = n.Drain()
+	err = n.Drain(m.k8sClientset)
 	if err != nil {
 		log.WithError(err).Errorf("failed to drain node %s", node.Name)
 		return err
@@ -164,7 +164,7 @@ func (m *networkMigrator) setupCalicoNetworkForNode(node *v1.Node) error {
 	log.Infof("Removing flannel tunnel device/routes on %s.", node.Name)
 	// Remove Flannel network from node.
 	// Note Flannel vxlan tunnel device (flannel.1) is created by Flannel daemonset pod (not Flannel CNI)
-	// Therefore if Flannel daemonset pod can not run on this node, the tunnel device will not be recreated
+	// Therefore if Flannel daemonset pod cannot run on this node, the tunnel device will not be recreated
 	// after we delete it.
 	err = m.removeFlannelNetworkAndInstallDummyCalicoCNI(node)
 	if err != nil {
@@ -209,7 +209,7 @@ func (m *networkMigrator) setupCalicoNetworkForNode(node *v1.Node) error {
 	}
 
 	// Uncordon node.
-	err = n.Uncordon()
+	err = n.Uncordon(m.k8sClientset)
 	if err != nil {
 		log.WithError(err).Errorf("failed to uncordon node %s", node.Name)
 		return err

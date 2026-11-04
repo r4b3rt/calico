@@ -18,12 +18,10 @@ import (
 	"context"
 	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
@@ -35,7 +33,6 @@ import (
 )
 
 var _ = testutils.E2eDatastoreDescribe("KubeControllersConfiguration tests", testutils.DatastoreAll, func(config apiconfig.CalicoAPIConfig) {
-
 	ctx := context.Background()
 	name := "default"
 	port := 9094
@@ -71,10 +68,13 @@ var _ = testutils.E2eDatastoreDescribe("KubeControllersConfiguration tests", tes
 			Namespace:        &apiv3.NamespaceControllerConfig{ReconcilerPeriod: &metav1.Duration{Duration: time.Minute * 6}},
 		},
 	}
+	defaultMetricsPort := 9094
 	status1 := apiv3.KubeControllersConfigurationStatus{
-		RunningConfig: apiv3.KubeControllersConfigurationSpec{
-			LogSeverityScreen: "Debug",
-			HealthChecks:      apiv3.Enabled,
+		// runningConfig reuses the spec type, so the CRD defaults its port too.
+		RunningConfig: &apiv3.KubeControllersConfigurationSpec{
+			LogSeverityScreen:     "Debug",
+			HealthChecks:          apiv3.Enabled,
+			PrometheusMetricsPort: &defaultMetricsPort,
 			Controllers: apiv3.ControllersConfig{
 				Node: &apiv3.NodeControllerConfig{
 					ReconcilerPeriod: &metav1.Duration{Duration: time.Second * 330},
@@ -93,8 +93,9 @@ var _ = testutils.E2eDatastoreDescribe("KubeControllersConfiguration tests", tes
 		},
 	}
 	status2 := apiv3.KubeControllersConfigurationStatus{
-		RunningConfig: apiv3.KubeControllersConfigurationSpec{
-			HealthChecks: apiv3.Disabled,
+		RunningConfig: &apiv3.KubeControllersConfigurationSpec{
+			HealthChecks:          apiv3.Disabled,
+			PrometheusMetricsPort: &defaultMetricsPort,
 			Controllers: apiv3.ControllersConfig{
 				Node: &apiv3.NodeControllerConfig{
 					ReconcilerPeriod: &metav1.Duration{Duration: time.Second * 330},
@@ -133,7 +134,7 @@ var _ = testutils.E2eDatastoreDescribe("KubeControllersConfiguration tests", tes
 		func(name string, spec1, spec2 apiv3.KubeControllersConfigurationSpec, status1, status2 apiv3.KubeControllersConfigurationStatus) {
 			By("Updating the KubeControllersConfiguration before it is created")
 			_, outError := c.KubeControllersConfiguration().Update(ctx, &apiv3.KubeControllersConfiguration{
-				ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: "test-fail-kubecontrollersconfig"},
+				ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -177,7 +178,7 @@ var _ = testutils.E2eDatastoreDescribe("KubeControllersConfiguration tests", tes
 				Spec:       spec2,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
-			Expect(outError.Error()).To(Equal("resource already exists: KubeControllersConfiguration(" + name + ")"))
+			Expect(outError.Error()).To(ContainSubstring("resource already exists: KubeControllersConfiguration(" + name + ") with error:"))
 
 			By("Getting KubeControllersConfiguration and comparing the output against spec1")
 			res, outError := c.KubeControllersConfiguration().Get(ctx, name, options.GetOptions{})
@@ -200,7 +201,7 @@ var _ = testutils.E2eDatastoreDescribe("KubeControllersConfiguration tests", tes
 
 			By("Attempting to update the KubeControllersConfiguration without a Creation Timestamp")
 			res, outError = c.KubeControllersConfiguration().Update(ctx, &apiv3.KubeControllersConfiguration{
-				ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "1234", UID: "test-fail-kubecontrollersconfig"},
+				ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "1234", UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -265,7 +266,7 @@ var _ = testutils.E2eDatastoreDescribe("KubeControllersConfiguration tests", tes
 
 			By("Setting status1 on resource")
 			res.Status = status1
-			res, outError = c.KubeControllersConfiguration().Update(ctx, res, options.SetOptions{})
+			res, outError = c.KubeControllersConfiguration().UpdateStatus(ctx, res, options.SetOptions{})
 			Expect(outError).ToNot(HaveOccurred())
 			Expect(res).To(MatchResourceWithStatus(apiv3.KindKubeControllersConfiguration, testutils.ExpectNoNamespace, name, spec2, status1))
 
@@ -276,7 +277,7 @@ var _ = testutils.E2eDatastoreDescribe("KubeControllersConfiguration tests", tes
 
 			By("Setting status2 on resource")
 			res.Status = status2
-			res, outError = c.KubeControllersConfiguration().Update(ctx, res, options.SetOptions{})
+			res, outError = c.KubeControllersConfiguration().UpdateStatus(ctx, res, options.SetOptions{})
 			Expect(outError).ToNot(HaveOccurred())
 			Expect(res).To(MatchResourceWithStatus(apiv3.KindKubeControllersConfiguration, testutils.ExpectNoNamespace, name, spec2, status2))
 			rv1_3 := res.ResourceVersion
@@ -302,7 +303,6 @@ var _ = testutils.E2eDatastoreDescribe("KubeControllersConfiguration tests", tes
 			outList, outError = c.KubeControllersConfiguration().List(ctx, options.ListOptions{})
 			Expect(outError).NotTo(HaveOccurred())
 			Expect(outList.Items).To(HaveLen(0))
-
 		},
 
 		// Test 1: Pass two fully populated KubeControllersConfigurationSpecs and expect the series of operations to succeed.
@@ -439,13 +439,142 @@ var _ = testutils.E2eDatastoreDescribe("KubeControllersConfiguration tests", tes
 			By("Cleaning the datastore and expecting deletion events for each configured resource (tests prefix deletes results in individual events for each key)")
 			err = be.Clean()
 			Expect(err).NotTo(HaveOccurred())
-			testWatcher3.ExpectEvents(apiv3.KindKubeControllersConfiguration, []watch.Event{
+			testWatcher3.ExpectEventsAnyOrder(apiv3.KindKubeControllersConfiguration, []watch.Event{
 				{
 					Type:     watch.Deleted,
 					Previous: outRes3,
 				},
 			})
 			testWatcher3.Stop()
+		})
+	})
+
+	Describe("KubeControllersConfig HostEndpoint validation", func() {
+		It("should validate HostEndpoints config", func() {
+			kcc := apiv3.NewKubeControllersConfiguration()
+			kcc.Name = "default"
+			kcc.Spec = apiv3.KubeControllersConfigurationSpec{
+				HealthChecks:          apiv3.Enabled,
+				PrometheusMetricsPort: &port,
+				Controllers: apiv3.ControllersConfig{
+					Node: &apiv3.NodeControllerConfig{
+						ReconcilerPeriod: &metav1.Duration{Duration: time.Second * 330},
+						SyncLabels:       apiv3.Enabled,
+						HostEndpoint:     nil,
+					},
+				},
+			}
+
+			templateEmptyCIDRInterfacePattern := apiv3.AutoHostEndpointConfig{
+				AutoCreate:                "Enabled",
+				CreateDefaultHostEndpoint: "Enabled",
+				Templates: []apiv3.Template{
+					{
+						GenerateName:   "TemplateName",
+						InterfaceCIDRs: nil,
+					},
+				},
+			}
+
+			templateEmptyName := apiv3.AutoHostEndpointConfig{
+				AutoCreate:                "Enabled",
+				CreateDefaultHostEndpoint: "Enabled",
+				Templates: []apiv3.Template{
+					{
+						InterfaceCIDRs: []string{"10.0.0.0/24"},
+					},
+				},
+			}
+
+			templateLongName := apiv3.AutoHostEndpointConfig{
+				AutoCreate:                "Enabled",
+				CreateDefaultHostEndpoint: "Enabled",
+				Templates: []apiv3.Template{
+					{
+						GenerateName:   "the-quick-brown-fox-jumps-over-the-lazy-dog-the-quick-brown-fox-jumps-over-the-lazy-dog-the-quick-brown-fox-jumps-over-the-lazy-dog-the-quick-brown-fox-jumps-over-the-lazy-dog-the-quick-brown-fox-jumps-over-the-lazy-dog-the-quick-brown-fox-jumps-over-the-lazy-dog",
+						InterfaceCIDRs: []string{"10.0.0.0/24"},
+					},
+				},
+			}
+
+			templateDuplicateName := apiv3.AutoHostEndpointConfig{
+				AutoCreate:                "Enabled",
+				CreateDefaultHostEndpoint: "Enabled",
+				Templates: []apiv3.Template{
+					{
+						GenerateName:   "TemplateName",
+						InterfaceCIDRs: []string{"10.0.0.0/24"},
+					},
+					{
+						GenerateName:   "TemplateName",
+						InterfaceCIDRs: []string{"10.0.0.0/24"},
+					},
+				},
+			}
+
+			templateValid := apiv3.AutoHostEndpointConfig{
+				AutoCreate:                "Enabled",
+				CreateDefaultHostEndpoint: "Enabled",
+				Templates: []apiv3.Template{
+					{
+						GenerateName:   "template",
+						InterfaceCIDRs: []string{"10.0.0.0/24"},
+						Labels:         map[string]string{"label": "value"},
+						NodeSelector:   "all()",
+					},
+				},
+			}
+
+			templateValid2 := apiv3.AutoHostEndpointConfig{
+				AutoCreate:                "Enabled",
+				CreateDefaultHostEndpoint: "Enabled",
+				Templates: []apiv3.Template{
+					{
+						GenerateName:     "template",
+						InterfacePattern: "eth.*",
+						Labels:           map[string]string{"label": "value"},
+						NodeSelector:     "all()",
+					},
+				},
+			}
+
+			By("Creating kcc with empty CIDR and interfacePattern")
+			kcc.Spec.Controllers.Node.HostEndpoint = &templateEmptyCIDRInterfacePattern
+			_, outError := c.KubeControllersConfiguration().Create(ctx, kcc, options.SetOptions{})
+			Expect(outError).To(HaveOccurred())
+			Expect(outError.Error()).To(ContainSubstring("InterfaceCIDRs or InterfacePattern must be specified"))
+
+			By("Creating kcc with empty template name")
+			kcc.Spec.Controllers.Node.HostEndpoint = &templateEmptyName
+			_, outError = c.KubeControllersConfiguration().Create(ctx, kcc, options.SetOptions{})
+			Expect(outError).To(HaveOccurred())
+			Expect(outError.Error()).To(ContainSubstring("Template name must be specified"))
+
+			By("Creating kcc with long template name")
+			kcc.Spec.Controllers.Node.HostEndpoint = &templateLongName
+			_, outError = c.KubeControllersConfiguration().Create(ctx, kcc, options.SetOptions{})
+			Expect(outError).To(HaveOccurred())
+			Expect(outError.Error()).To(ContainSubstring("Template name must be shorter than 253 characters"))
+
+			By("Creating kcc with duplicate template name")
+			kcc.Spec.Controllers.Node.HostEndpoint = &templateDuplicateName
+			_, outError = c.KubeControllersConfiguration().Create(ctx, kcc, options.SetOptions{})
+			Expect(outError).To(HaveOccurred())
+			Expect(outError.Error()).To(ContainSubstring("Template name must be unique"))
+
+			By("Creating kcc with valid template")
+			kcc.Spec.Controllers.Node.HostEndpoint = &templateValid
+			_, outError = c.KubeControllersConfiguration().Create(ctx, kcc, options.SetOptions{})
+			Expect(outError).ToNot(HaveOccurred())
+
+			// Clean up the created KCC before the next test.
+			_, outError = c.KubeControllersConfiguration().Delete(ctx, kcc.Name, options.DeleteOptions{})
+			Expect(outError).ToNot(HaveOccurred())
+
+			By("Creating kcc with valid template")
+			kcc.Spec.Controllers.Node.HostEndpoint = &templateValid2
+			_, outError = c.KubeControllersConfiguration().Create(ctx, kcc, options.SetOptions{})
+			Expect(outError).ToNot(HaveOccurred())
 		})
 	})
 })

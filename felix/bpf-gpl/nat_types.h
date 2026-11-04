@@ -5,17 +5,20 @@
 #ifndef __CALI_NAT_TYPES_H__
 #define __CALI_NAT_TYPES_H__
 
-#include "bpf.h"
+#include "cali_bpf.h"
+#include "ip_addr.h"
 
 typedef enum calico_nat_lookup_result {
 	NAT_LOOKUP_ALLOW,
 	NAT_FE_LOOKUP_DROP,
 	NAT_NO_BACKEND,
+	NAT_EXCLUDE,
+	NAT_MAGLEV,
 } nat_lookup_result;
 
 
-struct calico_nat_v4 {
-        __u32 addr; // NBO
+struct calico_nat {
+        ipv46_addr_t addr; // NBO
         __u16 port; // HBO
         __u8 protocol;
 };
@@ -24,31 +27,26 @@ struct calico_nat_v4 {
  * Modified the map from HASH to LPM_TRIE. This is to drop packets outside
  * src IP range specified for Load Balancer
  */
-struct __attribute__((__packed__)) calico_nat_v4_key {
+struct __attribute__((__packed__)) calico_nat_key {
 	__u32 prefixlen;
-	__u32 addr; // NBO
+	ipv46_addr_t addr; // NBO
 	__u16 port; // HBO
 	__u8 protocol;
-	__u32 saddr;
+	ipv46_addr_t saddr;
 	__u8 pad;
 };
 
 /* Prefix len = (dst_addr + port + protocol + src_addr) in bits. */
-#define NAT_PREFIX_LEN_WITH_SRC_MATCH  (sizeof(struct calico_nat_v4_key) - \
-					sizeof(((struct calico_nat_v4_key*)0)->prefixlen) - \
-					sizeof(((struct calico_nat_v4_key*)0)->pad))
+#define NAT_PREFIX_LEN_WITH_SRC_MATCH  (sizeof(struct calico_nat_key) - \
+					sizeof(((struct calico_nat_key*)0)->prefixlen) - \
+					sizeof(((struct calico_nat_key*)0)->pad))
 
 #define NAT_PREFIX_LEN_WITH_SRC_MATCH_IN_BITS (NAT_PREFIX_LEN_WITH_SRC_MATCH * 8)
 
 // This is used as a special ID along with count=0 to drop a packet at nat level1 lookup
 #define NAT_FE_DROP_COUNT  0xffffffff
 
-union calico_nat_v4_lpm_key {
-        struct bpf_lpm_trie_key lpm;
-        struct calico_nat_v4_key key;
-};
-
-struct calico_nat_v4_value {
+struct calico_nat_value {
 	__u32 id;
 	__u32 count;
 	__u32 local;
@@ -58,50 +56,88 @@ struct calico_nat_v4_value {
 
 #define NAT_FLG_EXTERNAL_LOCAL	0x1
 #define NAT_FLG_INTERNAL_LOCAL	0x2
+#define NAT_FLG_NAT_EXCLUDE	0x4
+#define NAT_FLG_MAGLEV		0X8
 
-CALI_MAP(cali_v4_nat_fe, 3,
+#ifdef IPVER6
+CALI_MAP_NAMED(cali_v6_nat_fe, cali_nat_fe, 3,
+#else
+CALI_MAP_NAMED(cali_v4_nat_fe, cali_nat_fe, 3,
+#endif
 		BPF_MAP_TYPE_LPM_TRIE,
-		union calico_nat_v4_lpm_key, struct calico_nat_v4_value,
+		struct calico_nat_key, struct calico_nat_value,
 		64*1024, BPF_F_NO_PREALLOC)
 
 
 // Map: NAT level two.  ID and ordinal -> new dest and port.
 
-struct calico_nat_secondary_v4_key {
+struct calico_nat_secondary_key {
 	__u32 id;
 	__u32 ordinal;
 };
 
 struct calico_nat_dest {
-	__u32 addr;
+	ipv46_addr_t addr;
 	__u16 port;
 	__u8 pad[2];
 };
 
-CALI_MAP_V1(cali_v4_nat_be,
+#ifdef IPVER6
+CALI_MAP_NAMED(cali_v6_nat_be, cali_nat_be,,
+#else
+CALI_MAP_NAMED(cali_v4_nat_be, cali_nat_be,,
+#endif
 		BPF_MAP_TYPE_HASH,
-		struct calico_nat_secondary_v4_key, struct calico_nat_dest,
+		struct calico_nat_secondary_key, struct calico_nat_dest,
 		256*1024, BPF_F_NO_PREALLOC)
 
-struct calico_nat_v4_affinity_key {
-	struct calico_nat_v4 nat_key;
-	__u32 client_ip;
+struct calico_nat_affinity_key {
+	struct calico_nat nat_key;
+	ipv46_addr_t client_ip;
 	__u32 padding;
 };
 
-struct calico_nat_v4_affinity_val {
+struct calico_nat_affinity_val {
 	struct calico_nat_dest nat_dest;
+#ifdef IPVER6
+	__u32 __pad;
+#endif
 	__u64 ts;
 };
 
 
-CALI_MAP_V1(cali_v4_nat_aff,
+#ifdef IPVER6
+CALI_MAP_NAMED(cali_v6_nat_aff, cali_nat_aff,,
+#else
+CALI_MAP_NAMED(cali_v4_nat_aff, cali_nat_aff,,
+#endif
 		BPF_MAP_TYPE_LRU_HASH,
-		struct calico_nat_v4_affinity_key, struct calico_nat_v4_affinity_val,
+		struct calico_nat_affinity_key, struct calico_nat_affinity_val,
 		64*1024, 0)
 
 struct vxlanhdr {
 	__be32 flags;
 	__be32 vni;
 };
+
+#ifndef CALI_VXLAN_VNI
+#define CALI_VXLAN_VNI 0xca11c0
+#endif
+
+#define vxlan_udp_csum_ok(udp) ((udp)->check == 0)
+
+struct cali_maglev_key {
+	__u32 sid;
+	__u32 ordinal; // should always be a value of [0..M-1], where M is a very large prime number. -Alex
+};
+
+#ifdef IPVER6
+CALI_MAP_NAMED(cali_v6_mglv, cali_maglev,2,
+#else
+CALI_MAP_NAMED(cali_v4_mglv, cali_maglev,2,
+#endif
+		BPF_MAP_TYPE_HASH,
+		struct cali_maglev_key, struct calico_nat_dest,
+		1009, BPF_F_NO_PREALLOC)
+
 #endif /*  __CALI_NAT_TYPES_H__ */

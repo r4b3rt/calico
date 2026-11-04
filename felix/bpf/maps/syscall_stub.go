@@ -16,7 +16,7 @@
 
 package maps
 
-func NewIterator(mapFD FD, keySize, valueSize, maxEntries int) (*Iterator, error) {
+func NewIterator(mapFD FD, keySize, valueSize, maxEntries int, batchLookupSupported bool) (*Iterator, error) {
 	panic("BPF syscall stub")
 }
 
@@ -44,11 +44,11 @@ func GetMapInfo(fd FD) (*MapInfo, error) {
 	panic("BPF syscall stub")
 }
 
-func DeleteMapEntry(mapFD FD, k []byte, valueSize int) error {
+func DeleteMapEntry(mapFD FD, k []byte) error {
 	panic("BPF syscall stub")
 }
 
-func DeleteMapEntryIfExists(mapFD FD, k []byte, valueSize int) error {
+func DeleteMapEntryIfExists(mapFD FD, k []byte) error {
 	panic("BPF syscall stub")
 }
 
@@ -69,4 +69,12 @@ func (m *Iterator) Next() (k, v []byte, err error) {
 
 func (m *Iterator) Close() error {
 	return nil
+}
+
+func createMap(name string, mapType, keySize, valueSize, maxEntries, flags uint32) (FD, error) {
+	panic("BPF syscall stub")
+}
+
+func batchLookup(mapFD FD, keySize, valueSize int) error {
+	panic("BPF syscall stub")
 }

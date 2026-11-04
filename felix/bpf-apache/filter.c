@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -53,13 +53,13 @@ CALI_BPF_INLINE static int extract_ports(__u32 len, struct iphdr * h,
 }
 
 
-__attribute__((section("prefilter_func")))
+SEC("xdp")
 enum xdp_action prefilter(struct xdp_md* xdp)
 {
 	struct ethhdr * ehdr;
 	struct iphdr  * ihdr;
 	struct protoport dport = {0,0};
-	union ip4_bpf_lpm_trie_key sip;
+	struct ip4key sip;
 
 	// You must be at least 'UDP header' tall to take this ride.
 	if (xdp->data + sizeof(*ehdr) + sizeof(*ihdr) + sizeof(struct udphdr)
@@ -87,8 +87,8 @@ enum xdp_action prefilter(struct xdp_md* xdp)
 		}
 	}
 
-	ip4val_to_lpm(&sip, 32, ihdr->saddr);
-
+	sip.addr = ihdr->saddr;
+	sip.mask = 32;
 	// Drop the packet if source IP matches a blocklist entry.
 	if (NULL != bpf_map_lookup_elem(&calico_prefilter_v4, &sip)) {
 		// In blocklist - "thou shall not XDP_PASS!"

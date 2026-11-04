@@ -25,7 +25,7 @@ func IntersectCIDRs(aStrs []string, bStrs []string) (out []string) {
 	aCIDRs := parseCIDRs(aStrs)
 	bCIDRs := parseCIDRs(bStrs)
 
-	intersection := set.NewBoxed[ip.CIDR]()
+	intersection := set.New[ip.CIDR]()
 
 	for _, a := range aCIDRs {
 		for _, b := range bCIDRs {
@@ -52,10 +52,10 @@ func IntersectCIDRs(aStrs []string, bStrs []string) (out []string) {
 		}
 	}
 
-	intersection.Iter(func(cidr ip.CIDR) error {
+	for cidr := range intersection.All() {
 		out = append(out, cidr.String())
-		return set.RemoveItem
-	})
+		intersection.Discard(cidr)
+	}
 
 	// Sort the output for determinism both in testing and in rule generation.
 	sort.Strings(out)

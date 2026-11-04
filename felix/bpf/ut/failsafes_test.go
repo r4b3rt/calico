@@ -19,8 +19,8 @@ import (
 	"net"
 	"testing"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/felix/bpf/failsafes"
@@ -167,6 +167,22 @@ var failsafeTests = []failsafeTest{
 		Allowed:  false,
 	},
 	{
+		Description: "Packets from localhost to non-failsafe IP and failsafe port are denied",
+		Rules:       &denyAllRulesHost,
+		IPHeaderIPv4: &layers.IPv4{
+			Version:  4,
+			IHL:      5,
+			TTL:      64,
+			Flags:    layers.IPv4DontFragment,
+			SrcIP:    dstIP,
+			DstIP:    srcIP,
+			Protocol: layers.IPProtocolUDP,
+		},
+		Outbound:      true,
+		Allowed:       false,
+		FromLocalHost: true,
+	},
+	{
 		Description: "Packets from localhost to failsafe IP and non-failsafe port are denied",
 		Rules:       &denyAllRulesHost,
 		IPHeaderIPv4: &layers.IPv4{
@@ -217,7 +233,7 @@ func TestFailsafes(t *testing.T) {
 
 	for _, test := range failsafeTests {
 		t.Run(test.Description, func(t *testing.T) {
-			_, _, _, _, pktBytes, err := testPacket(nil, test.IPHeaderIPv4, test.IPHeaderUDP, nil)
+			_, _, _, _, pktBytes, err := testPacketV4(nil, test.IPHeaderIPv4, test.IPHeaderUDP, nil)
 			Expect(err).NotTo(HaveOccurred())
 
 			prog := "calico_from_host_ep"
@@ -237,6 +253,9 @@ func TestFailsafes(t *testing.T) {
 			result := "TC_ACT_SHOT"
 			if test.Allowed {
 				result = "TC_ACT_UNSPEC"
+				if prog == "calico_from_host_ep" {
+					result = "TC_ACT_REDIRECT"
+				}
 			}
 
 			runBpfTest(t, prog, test.Rules, func(bpfrun bpfProgRunFn) {

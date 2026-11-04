@@ -21,17 +21,17 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/testutils"
+	"github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-
-	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 )
@@ -66,9 +66,13 @@ func createPod(clientset *kubernetes.Clientset, d deployment, nsName string, spe
 	// the link but then LinkByName wouldn't find it.  It's not clear why doing that helps but it
 	// may be that the kernel enforces consistency when you re-use the same socket, or, it may be
 	// that load causes the issue and we put less load on the kernel.
-	handle, err := netlink.NewHandle()
+	handle, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
 	panicIfError(err)
-	defer handle.Close()
+	defer func() {
+		if err := handle.Close(); err != nil {
+			log.WithError(err).Warn("Failed to close netlink handle")
+		}
+	}()
 
 	name := spec.name
 	if name == "" {
@@ -97,7 +101,7 @@ func createPod(clientset *kubernetes.Clientset, d deployment, nsName string, spe
 		},
 	}
 	if spec.labels != nil {
-		pod_in.ObjectMeta.Labels = spec.labels
+		pod_in.Labels = spec.labels
 	}
 	log.WithField("pod_in", pod_in).Debug("Pod defined")
 	pod_out, err := clientset.CoreV1().Pods(nsName).Create(context.Background(), pod_in, metav1.CreateOptions{})
@@ -170,7 +174,7 @@ func createPod(clientset *kubernetes.Clientset, d deployment, nsName string, spe
 		panicIfError(err)
 
 		// Set the host end up too.
-		hostIf, err := handle.LinkByName(veth.LinkAttrs.Name)
+		hostIf, err := handle.LinkByName(veth.Name)
 		log.WithField("hostIf", hostIf).Debug("Host end")
 		panicIfError(err)
 		err = handle.LinkSetUp(hostIf)
@@ -191,7 +195,7 @@ func createPod(clientset *kubernetes.Clientset, d deployment, nsName string, spe
 
 func removeLocalPodNetworking(pod *v1.Pod) {
 	// Retrieve local networking details for this pod.
-	key := pod.ObjectMeta.Namespace + "." + pod.ObjectMeta.Name
+	key := pod.Namespace + "." + pod.Name
 
 	// Lock mutex, as we do pod cleanup from multiple goroutines.
 	localNetworkingMutex.Lock()
@@ -230,7 +234,7 @@ func cleanupAllPods(clientset *kubernetes.Clientset, nsPrefix string) {
 	waiter := sync.WaitGroup{}
 	waiter.Add(len(nsList.Items))
 	for _, ns := range nsList.Items {
-		nsName := ns.ObjectMeta.Name
+		nsName := ns.Name
 		log.Infof("Queueing examination of namespace: %v", nsName)
 		go func() {
 			admission <- 1
@@ -243,12 +247,12 @@ func cleanupAllPods(clientset *kubernetes.Clientset, nsPrefix string) {
 				log.WithField("count", len(podList.Items)).WithField("namespace", nsName).Debug(
 					"Pods present")
 				for _, pod := range podList.Items {
-					log.Infof("Deleting pod: %v", pod.ObjectMeta.Name)
-					err = clientset.CoreV1().Pods(nsName).Delete(context.Background(), pod.ObjectMeta.Name, deleteImmediately)
+					log.Infof("Deleting pod: %v", pod.Name)
+					err = clientset.CoreV1().Pods(nsName).Delete(context.Background(), pod.Name, deleteImmediately)
 					panicIfError(err)
-					log.Infof("Deleted pod, cleaning up its netns: %v", pod.ObjectMeta.Name)
+					log.Infof("Deleted pod, cleaning up its netns: %v", pod.Name)
 					removeLocalPodNetworking(&pod)
-					log.Infof("Cleaned up pod netns: %v", pod.ObjectMeta.Name)
+					log.Infof("Cleaned up pod netns: %v", pod.Name)
 				}
 				podsDeleted += len(podList.Items)
 			}
@@ -259,8 +263,8 @@ func cleanupAllPods(clientset *kubernetes.Clientset, nsPrefix string) {
 	waiter.Wait()
 
 	log.WithField("podsDeleted", podsDeleted).Info("Cleaned up all pods, checking metrics...")
-	Eventually(getNumEndpointsDefault(-1), "30s", "1s").Should(
-		BeNumerically("==", 0),
+	gomega.Eventually(getNumEndpointsDefault(-1), "30s", "1s").Should(
+		gomega.BeNumerically("==", 0),
 		"Removal of pods wasn't reflected in Felix metrics",
 	)
 	log.WithField("podsDeleted", podsDeleted).Info("Pod cleanup done.")

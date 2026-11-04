@@ -1,5 +1,3 @@
-//go:build fvtests
-
 // Copyright (c) 2017-2018,2021 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,12 +17,11 @@ package fv_test
 import (
 	"os"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	log "github.com/sirupsen/logrus"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/felix/fv/metrics"
@@ -42,7 +39,7 @@ func MetricsPortReachable(felix *infrastructure.Felix, bpf bool) bool {
 	// Delete existing conntrack state for the metrics port.
 	felix.Exec("conntrack", "-L")
 	felix.Exec("conntrack", "-L", "-p", "tcp", "--dport", metrics.PortString())
-	felix.ExecMayFail("conntrack", "-D", "-p", "tcp", "--orig-port-dst", metrics.PortString())
+	_ = felix.ExecMayFail("conntrack", "-D", "-p", "tcp", "--orig-port-dst", metrics.PortString())
 
 	// Now try to get a metric.
 	m, err := metrics.GetFelixMetric(felix.IP, "felix_active_local_endpoints")
@@ -75,7 +72,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ host-port tests", []apiconf
 	var (
 		bpfEnabled           = os.Getenv("FELIX_FV_ENABLE_BPF") == "true"
 		infra                infrastructure.DatastoreInfra
-		felix                *infrastructure.Felix
+		tc                   infrastructure.TopologyContainers
 		client               client.Interface
 		metricsPortReachable func() bool
 	)
@@ -85,26 +82,15 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ host-port tests", []apiconf
 
 		options := infrastructure.DefaultTopologyOptions()
 		options.NeedNodeIP = bpfEnabled
-		felix, client = infrastructure.StartSingleNodeTopology(options, infra)
+		tc, client = infrastructure.StartSingleNodeTopology(options, infra)
 
 		metricsPortReachable = func() bool {
-			return MetricsPortReachable(felix, bpfEnabled)
+			return MetricsPortReachable(tc.Felixes[0], bpfEnabled)
 		}
 
 		if bpfEnabled {
-			Eventually(felix.NumTCBPFProgsEth0, "5s", "200ms").Should(Equal(2))
+			Eventually(tc.Felixes[0].NumTCBPFProgsEth0, "5s", "200ms").Should(Equal(2))
 		}
-	})
-
-	AfterEach(func() {
-		if CurrentGinkgoTestDescription().Failed {
-			infra.DumpErrorData()
-			felix.Exec("iptables-save", "-c")
-			felix.Exec("ip", "r")
-			felix.Exec("ip", "a")
-		}
-		felix.Stop()
-		infra.Stop()
 	})
 
 	It("with no endpoints or policy, port should be reachable", func() {
@@ -112,7 +98,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ host-port tests", []apiconf
 	})
 
 	It("with a local workload, port should be reachable", func() {
-		w := workload.Run(felix, "w", "default", "10.65.0.2", "8055", "tcp")
+		w := workload.Run(tc.Felixes[0], "w", "default", "10.65.0.2", "8055", "tcp")
 		w.ConfigureInInfra(infra)
 		Eventually(metricsPortReachable, "10s", "1s").Should(BeTrue(), "Not reachable with workload running")
 		w.Stop()
@@ -177,7 +163,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ host-port tests", []apiconf
 			hostEp := api.NewHostEndpoint()
 			hostEp.Name = "host-endpoint-1"
 			hostEp.Labels = map[string]string{"host-endpoint": "true"}
-			hostEp.Spec.Node = felix.Hostname
+			hostEp.Spec.Node = tc.Felixes[0].Hostname
 			hostEp.Spec.InterfaceName = "eth0"
 			_, err := client.HostEndpoints().Create(utils.Ctx, hostEp, utils.NoOptions)
 			Expect(err).NotTo(HaveOccurred())
@@ -191,7 +177,7 @@ var _ = infrastructure.DatastoreDescribe("_BPF-SAFE_ host-port tests", []apiconf
 			hostEp := api.NewHostEndpoint()
 			hostEp.Name = "all-interfaces-hostendpoint"
 			hostEp.Labels = map[string]string{"host-endpoint": "true"}
-			hostEp.Spec.Node = felix.Hostname
+			hostEp.Spec.Node = tc.Felixes[0].Hostname
 			hostEp.Spec.InterfaceName = "*"
 			_, err := client.HostEndpoints().Create(utils.Ctx, hostEp, utils.NoOptions)
 			Expect(err).NotTo(HaveOccurred())

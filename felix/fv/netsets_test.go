@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
@@ -24,23 +22,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/projectcalico/calico/felix/fv/connectivity"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
-	"github.com/projectcalico/calico/felix/fv/infrastructure"
-	"github.com/projectcalico/calico/felix/fv/utils"
-	"github.com/projectcalico/calico/libcalico-go/lib/options"
-
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 
-	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/felix/fv/containers"
+	"github.com/projectcalico/calico/felix/fv/connectivity"
+	"github.com/projectcalico/calico/felix/fv/infrastructure"
+	"github.com/projectcalico/calico/felix/fv/utils"
 	"github.com/projectcalico/calico/felix/fv/workload"
+	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	"github.com/projectcalico/calico/libcalico-go/lib/net"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
 const (
@@ -48,7 +42,7 @@ const (
 	numNetworkSets = 100
 )
 
-// netsetsConfig is used to parametrise the whole suite of tests for IPv4 or IPv6, it provides
+// netsetsConfig is used to parameterize the whole suite of tests for IPv4 or IPv6, it provides
 // methods that return:
 //
 //   - the IP to use for a given workload, each from a separate subnet
@@ -96,11 +90,9 @@ func (c netsetsConfig) workloadFullLengthCIDR(workloadIdx int, namespaced bool) 
 	return addr + "/128"
 }
 
-var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd datastore", func() {
-
+var _ = infrastructure.DatastoreDescribe("_NET_SETS_ Network sets tests with initialized Felix and etcd datastore", []apiconfig.DatastoreType{apiconfig.EtcdV3}, func(getInfra infrastructure.InfraFactory) {
 	var (
-		etcd     *containers.Container
-		felix    *infrastructure.Felix
+		tc       infrastructure.TopologyContainers
 		felixPID int
 		client   client.Interface
 		infra    infrastructure.DatastoreInfra
@@ -108,21 +100,9 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 
 	BeforeEach(func() {
 		topologyOptions := infrastructure.DefaultTopologyOptions()
-		felix, etcd, client, infra = infrastructure.StartSingleNodeEtcdTopology(topologyOptions)
-		felixPID = felix.GetFelixPID()
-	})
-
-	AfterEach(func() {
-		if CurrentGinkgoTestDescription().Failed {
-			felix.Exec("iptables-save", "-c")
-		}
-		felix.Stop()
-
-		if CurrentGinkgoTestDescription().Failed {
-			etcd.Exec("etcdctl", "get", "/", "--prefix", "--keys-only")
-		}
-		etcd.Stop()
-		infra.Stop()
+		infra = getInfra()
+		tc, client = infrastructure.StartSingleNodeTopology(topologyOptions, infra)
+		felixPID = tc.Felixes[0].GetFelixPID()
 	})
 
 	describeConnTests := func(c netsetsConfig) {
@@ -149,11 +129,9 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 		BeforeEach(func() {
 			for ii := range w {
 				iiStr := strconv.Itoa(ii)
-				var ports string
-
-				ports = "3000"
+				ports := "3000"
 				w[ii] = workload.Run(
-					felix,
+					tc.Felixes[0],
 					"w"+iiStr,
 					"fv",
 					c.workloadIP(ii, false),
@@ -165,7 +143,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 				w[ii].Configure(client)
 
 				nw[ii] = workload.Run(
-					felix,
+					tc.Felixes[0],
 					"nw"+iiStr,
 					"fv",
 					c.workloadIP(ii, true),
@@ -206,8 +184,8 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 		})
 
 		assertNoConnectivity := func() {
-			for i := 0; i < len(w); i++ {
-				for j := 0; j < len(w); j++ {
+			for i := range len(w) {
+				for j := range len(w) {
 					if i != j {
 						cc.ExpectNone(w[i], w[j])
 						cc.ExpectNone(nw[i], nw[j])
@@ -465,12 +443,9 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 					namespacedSrcNS.Spec.Nets = []string{
 						c.workloadCIDR(1, 0, true),
 						c.workloadCIDR(2, 0, true),
-						// Lots of dupes...
+						// Exact duplicates fail list-type set validation, so repeat workload 3 via equivalent spellings and overlapping CIDRs.
 						c.workloadFullLengthCIDR(3, true),
-						c.workloadFullLengthCIDR(3, true),
-						c.workloadCIDR(3, 4, true),
-						c.workloadCIDR(3, 0, true),
-						c.workloadCIDR(3, 0, true),
+						c.workloadIP(3, true),
 						c.workloadCIDR(3, 4, true),
 						c.workloadCIDR(3, 0, true),
 					}
@@ -581,8 +556,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 
 			Describe("after updating rules to allow some traffic based on workload labels", func() {
 				BeforeEach(func() {
-					pol.Spec.Ingress[0].Source.Selector =
-						"has(allow-as-source) || name in {'" + nw[3].Name + "', '" + nw[0].Name + "'}"
+					pol.Spec.Ingress[0].Source.Selector = "has(allow-as-source) || name in {'" + nw[3].Name + "', '" + nw[0].Name + "'}"
 					pol = updatePolicy(pol)
 				})
 
@@ -617,7 +591,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 						cc.ExpectNone(nw[1], nw[2])
 						cc.ExpectNone(nw[1], nw[3])
 
-						// Doesn't match as a source any more.
+						// Doesn't match as a source anymore.
 						cc.ExpectNone(nw[2], nw[0])
 						cc.ExpectNone(nw[2], nw[1])
 						cc.ExpectNone(nw[2], nw[3])
@@ -883,12 +857,9 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 					srcNS.Spec.Nets = []string{
 						c.workloadCIDR(1, 0, false),
 						c.workloadCIDR(2, 0, false),
-						// Lots of dupes...
+						// Exact duplicates fail list-type set validation, so repeat workload 3 via equivalent spellings and overlapping CIDRs.
 						c.workloadFullLengthCIDR(3, false),
-						c.workloadFullLengthCIDR(3, false),
-						c.workloadCIDR(3, 4, false),
-						c.workloadCIDR(3, 0, false),
-						c.workloadCIDR(3, 0, false),
+						c.workloadIP(3, false),
 						c.workloadCIDR(3, 4, false),
 						c.workloadCIDR(3, 0, false),
 					}
@@ -999,8 +970,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 
 			Describe("after updating rules to allow some traffic based on workload labels", func() {
 				BeforeEach(func() {
-					pol.Spec.Ingress[0].Source.Selector =
-						"has(allow-as-source) || name in {'" + w[3].Name + "', '" + w[0].Name + "'}"
+					pol.Spec.Ingress[0].Source.Selector = "has(allow-as-source) || name in {'" + w[3].Name + "', '" + w[0].Name + "'}"
 					pol = updatePolicy(pol)
 				})
 
@@ -1035,7 +1005,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 						cc.ExpectNone(w[1], w[2])
 						cc.ExpectNone(w[1], w[3])
 
-						// Doesn't match as a source any more.
+						// Doesn't match as a source anymore.
 						cc.ExpectNone(w[2], w[0])
 						cc.ExpectNone(w[2], w[1])
 						cc.ExpectNone(w[2], w[3])
@@ -1056,15 +1026,6 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 					It("should have expected connectivity", assertBaselineNetsetsConnectivity)
 				})
 			})
-		})
-
-		AfterEach(func() {
-			for ii := range w {
-				w[ii].Stop()
-			}
-			for ii := range nw {
-				nw[ii].Stop()
-			}
 		})
 	}
 
@@ -1087,7 +1048,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 		BeforeEach(func() {
 			// Start a workload so we have something to add policy to
 			w := workload.Run(
-				felix,
+				tc.Felixes[0],
 				"w",
 				"default",
 				"10.65.0.2",
@@ -1097,7 +1058,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 			w.Configure(client)
 
 			nw := workload.Run(
-				felix,
+				tc.Felixes[0],
 				"w",
 				"default",
 				"10.64.0.2",
@@ -1107,7 +1068,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 			nw.Configure(client)
 
 			// Generate policies and network sets.
-			for i := 0; i < numPolicies; i++ {
+			for i := range numPolicies {
 				pol := api.NewGlobalNetworkPolicy()
 				pol.Name = fmt.Sprintf("policy-%d", i)
 				pol.Spec = api.GlobalNetworkPolicySpec{
@@ -1117,12 +1078,13 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 							Action: "Allow",
 							Source: api.EntityRule{
 								Selector: fmt.Sprintf("label == '%d'", i),
-							}},
+							},
+						},
 					},
 				}
 				policies = append(policies, pol)
 			}
-			for i := 0; i < numNetworkSets; i++ {
+			for i := range numNetworkSets {
 				ns := api.NewGlobalNetworkSet()
 				ns.Name = fmt.Sprintf("netset-%d", i)
 				ns.Labels = map[string]string{
@@ -1142,7 +1104,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 		churnPolicies := func(iterations int) {
 			log.Info("Churning policies...")
 			created := false
-			for i := 0; i < iterations; i++ {
+			for range iterations {
 				if created {
 					for _, pol := range policies {
 						log.WithField("policy", pol.Name).Info("Deleting policy")
@@ -1172,7 +1134,7 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 		churnNetworkSets := func(iterations int) {
 			log.Info("Churning network sets...")
 			created := false
-			for i := 0; i < iterations; i++ {
+			for range iterations {
 				if created {
 					for _, ns := range networkSets {
 						log.WithField("name", ns.Name).Info("Deleting network set")
@@ -1218,20 +1180,26 @@ var _ = Context("_NET_SETS_ Network sets tests with initialized Felix and etcd d
 			wg.Wait()
 
 			// getFelixPIDs may return more than one PID, transiently due to Felix calling fork().
-			Expect(felix.GetFelixPID()).To(Equal(felixPID))
+			Expect(tc.Felixes[0].GetFelixPID()).To(Equal(felixPID))
 		})
 	})
 })
 
+// generateNets returns n distinct random CIDRs, since network sets reject repeated entries.
 func generateNets(n int) []string {
 	var nets []string
-	for i := 0; i < n; i++ {
+	seen := map[string]bool{}
+	for len(nets) < n {
 		a := rand.Intn(255)
 		b := rand.Intn(255)
 		pr := rand.Intn(16) + 16
 		netStr := fmt.Sprintf("%d.%d.0.0/%d", a, b, pr)
 		_, cidr, err := net.ParseCIDR(netStr)
 		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to parse %s", netStr))
+		if seen[cidr.String()] {
+			continue
+		}
+		seen[cidr.String()] = true
 		nets = append(nets, cidr.String())
 	}
 	return nets

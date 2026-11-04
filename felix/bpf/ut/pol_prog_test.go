@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,17 +18,21 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	. "github.com/onsi/gomega"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-
 	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf"
 	"github.com/projectcalico/calico/felix/bpf/asm"
+	"github.com/projectcalico/calico/felix/bpf/hook"
 	"github.com/projectcalico/calico/felix/bpf/ipsets"
 	"github.com/projectcalico/calico/felix/bpf/jump"
 	"github.com/projectcalico/calico/felix/bpf/maps"
@@ -39,7 +43,7 @@ import (
 	"github.com/projectcalico/calico/felix/proto"
 )
 
-func TestLoadAllowAllProgram(t *testing.T) {
+func TestPolicyLoadAllowAllProgram(t *testing.T) {
 	RegisterTestingT(t)
 
 	b := asm.NewBlock(false)
@@ -60,7 +64,7 @@ func TestLoadAllowAllProgram(t *testing.T) {
 	Expect(rc.RC).To(BeNumerically("==", -1))
 }
 
-func TestLoadProgramWithMapAccess(t *testing.T) {
+func TestPolicyLoadProgramWithMapAccess(t *testing.T) {
 	RegisterTestingT(t)
 
 	ipsMap := ipsets.Map()
@@ -113,7 +117,7 @@ func makeRulesSingleTier(protoRules []*proto.Rule) polprog.Rules {
 	}
 }
 
-func TestLoadKitchenSinkPolicy(t *testing.T) {
+func TestPolicyLoadKitchenSinkPolicy(t *testing.T) {
 	RegisterTestingT(t)
 	alloc := idalloc.New()
 	allocID := func(id string) string {
@@ -123,7 +127,7 @@ func TestLoadKitchenSinkPolicy(t *testing.T) {
 
 	cleanIPSetMap()
 
-	pg := polprog.NewBuilder(alloc, ipsMap.MapFD(), stateMap.MapFD(), jumpMap.MapFD(),
+	pg := polprog.NewBuilder(alloc, ipsMap.MapFD(), stateMap.MapFD(), policyJumpMap[hook.Ingress].MapFD(), 0,
 		polprog.WithAllowDenyJumps(tcdefs.ProgIndexAllowed, tcdefs.ProgIndexDrop))
 	insns, err := pg.Instructions(polprog.Rules{
 		Tiers: []polprog.Tier{{
@@ -158,17 +162,18 @@ func TestLoadKitchenSinkPolicy(t *testing.T) {
 		}}})
 
 	Expect(err).NotTo(HaveOccurred())
-	fd, err := bpf.LoadBPFProgramFromInsns(insns, "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
+	Expect(insns).To(HaveLen(1))
+	fd, err := bpf.LoadBPFProgramFromInsns(insns[0], "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(fd).NotTo(BeZero())
 	Expect(fd.Close()).NotTo(HaveOccurred())
 }
 
-func TestLoadGarbageProgram(t *testing.T) {
+func TestPolicyLoadGarbageProgram(t *testing.T) {
 	RegisterTestingT(t)
 
 	var insns asm.Insns
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		i := uint8(i)
 		insns = append(insns, asm.Insn{Instruction: [8]uint8{i, i, i, i, i, i, i, i}})
 	}
@@ -1576,6 +1581,28 @@ var polProgramTests = []polProgramTest{
 		},
 	},
 	{
+		PolicyName: "allow from IP set - v6",
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:      "Allow",
+			SrcIpSetIds: []string{"setA"},
+		}}),
+		AllowedPackets: []packet{
+			packetNoPorts(253, "10::2", "10::1"),
+			tcpPkt("[10::2]:80", "[10::1]:31245"),
+			udpPkt("[10::2]:12345", "[123::1]:1024"),
+			udpPkt("[10::2]:80", "[10::1]:31245"),
+			udpPkt("[10::1]:31245", "[10::2]:80"),
+			//			icmpPkt("10::1", "10::2"),
+		},
+		DroppedPackets: []packet{
+			packetNoPorts(253, "11::2", "10::1"),
+			tcpPkt("[11::1]:12345", "[10::2]:8080")},
+		IPSets: map[string][]string{
+			"setA": {"10::0/16"},
+		},
+		ForIPv6: true,
+	},
+	{
 		PolicyName: "allow to IP set",
 		Policy: makeRulesSingleTier([]*proto.Rule{{
 			Action:      "Allow",
@@ -1591,6 +1618,24 @@ var polProgramTests = []polProgramTest{
 		IPSets: map[string][]string{
 			"setA": {"11.0.0.0/8", "123.0.0.1/32"},
 		},
+	},
+	{
+		PolicyName: "allow to IP set - v6",
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:      "Allow",
+			DstIpSetIds: []string{"setA"},
+		}}),
+		AllowedPackets: []packet{
+			packetNoPorts(253, "11::2", "11::1"),
+			udpPkt("[10::2]:12345", "[123::1]:1024")},
+		DroppedPackets: []packet{
+			packetNoPorts(253, "11::2", "10::1"),
+			tcpPkt("[11::1]:12345", "[10::2]:8080"),
+			udpPkt("[10::1]:31245", "[10::2]:80")},
+		IPSets: map[string][]string{
+			"setA": {"11::0/16", "123::1/128"},
+		},
+		ForIPv6: true,
 	},
 	{
 		PolicyName: "allow from !IP set",
@@ -1669,6 +1714,28 @@ var polProgramTests = []polProgramTest{
 			"setA": {"10.0.0.2/32,tcp:80"},
 			"setB": {"123.0.0.1/32,udp:1024"},
 		},
+	},
+	{
+		PolicyName: "allow to named ports - v6",
+		Policy: makeRulesSingleTier([]*proto.Rule{{
+			Action:               "Allow",
+			DstNamedPortIpSetIds: []string{"setA", "setB"},
+		}}),
+		AllowedPackets: []packet{
+			udpPkt("[10::2]:12345", "[123::1]:1024"),
+			tcpPkt("[10::1]:31245", "[10::2]:80")},
+		DroppedPackets: []packet{
+			packetNoPorts(253, "11::2", "10::2"),    // Wrong proto, no ports
+			tcpPkt("[11::1]:12345", "[10::2]:8080"), // Wrong port
+			udpPkt("[10::1]:31245", "[10::2]:80"),   // Wrong proto
+			tcpPkt("[10::2]:80", "[10::1]:31245"),   // Src/dest confusion
+			tcpPkt("[10::2]:31245", "[10::1]:80"),   // Wrong dest
+		},
+		IPSets: map[string][]string{
+			"setA": {"10::2/128,tcp:80"},
+			"setB": {"123::1/128,udp:1024"},
+		},
+		ForIPv6: true,
 	},
 	{
 		PolicyName: "allow to mixed ports",
@@ -2153,7 +2220,7 @@ func denyDest(name, dst string) []polprog.Policy {
 }
 
 // polProgramTestWrapper allows to keep polProgramTest intact as well as the tests that
-// use it. The wrapped object satisfies testCase interface that allows to use the same
+// use it. The wrapped object satisfies testPolicy interface that allows to use the same
 // algo for testing with different testcase options.
 type polProgramTestWrapper struct {
 	p polProgramTest
@@ -2202,36 +2269,419 @@ func (w polProgramTestWrapper) ForIPv6() bool {
 	return w.p.ForIPv6
 }
 
+func (w polProgramTestWrapper) Setup() error {
+	if w.p.SetupCB != nil {
+		return w.p.SetupCB()
+	}
+
+	return nil
+}
+
+func (w polProgramTestWrapper) TearDown() error {
+	if w.p.TearDownCB != nil {
+		return w.p.TearDownCB()
+	}
+
+	return nil
+}
+
 func wrap(p polProgramTest) polProgramTestWrapper {
 	return polProgramTestWrapper{p}
 }
 
 func TestPolicyPrograms(t *testing.T) {
 	for i, p := range polProgramTests {
-		if p.ForIPv6 {
-			// XXX skip for now
-			continue
-		}
 		t.Run(fmt.Sprintf("%d:Policy=%s", i, p.PolicyName), func(t *testing.T) { runTest(t, wrap(p)) })
 	}
 }
 
-func TestHostPolicyPrograms(t *testing.T) {
+func TestExpandedPolicyPrograms(t *testing.T) {
+	RegisterTestingT(t)
+	for i, p := range polProgramTests {
+		for _, expander := range testExpanders {
+			expandedP := expander.Expand(p)
+			Expect(expandedP).NotTo(Equal(p))
+			t.Run(fmt.Sprintf("%s/%d:Policy=%s", expander.Name, i, p.PolicyName),
+				func(t *testing.T) {
+					// Expansions result ina  lot of debug output, disable that.
+					logLevel := log.GetLevel()
+					defer log.SetLevel(logLevel)
+					log.SetLevel(log.InfoLevel)
+
+					runTest(t, wrap(expandedP), expandedP.Options...)
+				})
+		}
+	}
+}
+
+func execSysctl(param, value string) error {
+	cmd := exec.Command("sysctl", "-w", fmt.Sprintf("%s=%s", param, value))
+	_, err := cmd.CombinedOutput()
+	return err
+}
+
+var testExpanders = []testExpander{
+	{
+		Name: "WithLargePrefixedTier",
+		Expand: func(p polProgramTest) polProgramTest {
+			out := p
+			initExtraTierOnce.Do(initExtraTier)
+			out.Policy.Tiers = append([]polprog.Tier{extraTier}, out.Policy.Tiers...)
+			return out
+		},
+	},
+}
+
+var extraTier polprog.Tier
+var initExtraTierOnce sync.Once
+
+func initExtraTier() {
+	const numExtraPols = 250
+	const numRulesPerPol = 50
+	pols := make([]polprog.Policy, 0, numExtraPols)
+	for i := range numExtraPols {
+		pol := polprog.Policy{
+			Name: fmt.Sprintf("pol-%d", i),
+		}
+		for j := range numRulesPerPol {
+			pol.Rules = append(pol.Rules, noOpRule(i*numRulesPerPol+j))
+		}
+		pols = append(pols, pol)
+	}
+	// Need a pass rule somewhere to send traffic to the tier under
+	// test.
+	passRule := polprog.Rule{
+		Rule: &proto.Rule{
+			Action: "pass",
+		},
+		MatchID: polprog.RuleMatchID(numExtraPols * numRulesPerPol),
+	}
+	pols[len(pols)-1].Rules = append(pols[len(pols)-1].Rules, passRule)
+	extraTier = polprog.Tier{
+		Name:     "extra tier",
+		Policies: pols,
+	}
+}
+func noOpRule(n int) polprog.Rule {
+	actions := []string{
+		"allow", "deny", "pass",
+	}
+	ports := []*proto.PortRange{
+		{First: 1, Last: int32(1 + (n % 8000))},
+	}
+	if n%1000 == 0 {
+		// Add lots of ports to a handful of rules.
+		for p := range 2000 {
+			ports = append(ports, &proto.PortRange{
+				First: int32(p*2 + 10000),
+				Last:  int32(p*2 + 10001),
+			})
+		}
+	}
+	r := polprog.Rule{
+		Rule: &proto.Rule{
+			SrcIpSetIds: []string{"setNoOp"},
+			Protocol:    &proto.Protocol{NumberOrName: &proto.Protocol_Name{Name: "tcp"}},
+			Action:      actions[n%len(actions)],
+			DstPorts:    ports,
+		},
+		MatchID: polprog.RuleMatchID(n),
+	}
+	return r
+}
+
+type testExpander struct {
+	Name   string
+	Expand func(p polProgramTest) polProgramTest
+}
+
+type testFlowLogCase struct {
+	packet  packet
+	matches []uint64
+}
+
+func (tc testFlowLogCase) ForIPv6() bool {
+	// We are not supporting IPv6 yet
+	return false
+}
+
+func (tc testFlowLogCase) StateIn() state.State {
+	return tc.packet.StateIn()
+}
+
+func (tc testFlowLogCase) String() string {
+	return tc.packet.String()
+}
+
+func (tc testFlowLogCase) MatchStateOut(stateOut state.State) {
+	// Check no other fields got clobbered.
+	s := tc.StateIn()
+
+	// We do not record more then state.MaxRuleIDs as we do not have more space
+	s.RulesHit = uint32(len(tc.matches))
+	if s.RulesHit > state.MaxRuleIDs {
+		s.RulesHit = uint32(state.MaxRuleIDs)
+	}
+	copy(s.RuleIDs[:], tc.matches[:int(s.RulesHit)])
+
+	// Zero parts we do not care about
+	s.PolicyRC = 0 // PolicyRC tested by the caller
+	stateOut.PolicyRC = 0
+
+	Expect(stateOut).To(Equal(s), "policy program modified unexpected parts of the state")
+}
+
+type testFlowLog struct {
+	policy         polprog.Rules
+	allowedPackets []testFlowLogCase
+	droppedPackets []testFlowLogCase
+	ipSets         map[string][]string
+}
+
+func (t testFlowLog) UnmatchedPackets() []testCase {
+	return nil
+}
+
+func (t testFlowLog) XDP() bool {
+	return false
+}
+
+func (t testFlowLog) ForIPv6() bool {
+	return false
+}
+
+func (t testFlowLog) Policy() polprog.Rules {
+	return t.policy
+}
+
+func (t testFlowLog) AllowedPackets() []testCase {
+	ret := make([]testCase, len(t.allowedPackets))
+	for i, p := range t.allowedPackets {
+		ret[i] = p
+	}
+
+	return ret
+}
+
+func (t testFlowLog) DroppedPackets() []testCase {
+	ret := make([]testCase, len(t.droppedPackets))
+	for i, p := range t.droppedPackets {
+		ret[i] = p
+	}
+
+	return ret
+}
+
+func (t testFlowLog) IPSets() map[string][]string {
+	return t.ipSets
+}
+
+func (testFlowLog) Setup() error    { return nil }
+func (testFlowLog) TearDown() error { return nil }
+
+func TestPolicyProgramsExceedMatchIdSpace(t *testing.T) {
+	test := testFlowLog{
+		policy: polprog.Rules{},
+	}
+
+	pkt := testFlowLogCase{packet: icmpPktWithTypeCode("10.0.0.1", "10.0.0.2", 8, 3)}
+
+	// Fill the Policy with more then state.MaxRuleIDs all with a pass rule
+	for i := 0; i <= state.MaxRuleIDs; i++ {
+		test.policy.Tiers = append(test.policy.Tiers, polprog.Tier{
+			Policies: []polprog.Policy{{
+				Rules: []polprog.Rule{{
+					Rule:    &proto.Rule{Action: "Pass"},
+					MatchID: uint64(i + 1),
+				}},
+			}},
+		})
+		pkt.matches = append(pkt.matches, uint64(i+1))
+	}
+
+	// The last tier has an Allow rule which we must hit despite the fact that we cannot
+	// record anymore rule IDs. This must not break policy enforcement.
+	test.policy.Tiers = append(test.policy.Tiers, polprog.Tier{
+		Policies: []polprog.Policy{{
+			Rules: []polprog.Rule{{
+				Rule:    &proto.Rule{Action: "Allow"},
+				MatchID: uint64(state.MaxRuleIDs + 1),
+			}},
+		}},
+	})
+	pkt.matches = append(pkt.matches, uint64(state.MaxRuleIDs+1))
+
+	test.allowedPackets = []testFlowLogCase{pkt}
+
+	runTest(t, test, polprog.WithFlowLogs())
+}
+
+func TestPolicyProgramsFlowLog(t *testing.T) {
+	tests := []struct {
+		name string
+		test testFlowLog
+	}{
+		{
+			name: "no tiers - no profile match",
+			test: testFlowLog{
+				policy: polprog.Rules{
+					NoProfileMatchID: 0xdead0000beef0000,
+				},
+				droppedPackets: []testFlowLogCase{
+					{packet: udpPkt("10.0.0.1:31245", "10.0.0.2:80"), matches: []uint64{0xdead0000beef0000}},
+					{packet: tcpPkt("10.0.0.2:80", "10.0.0.1:31245"), matches: []uint64{0xdead0000beef0000}},
+					{packet: icmpPkt("10.0.0.1", "10.0.0.2"), matches: []uint64{0xdead0000beef0000}},
+				},
+			},
+		},
+		{
+			name: "pass to nowhere - pass and no profile matches",
+			test: testFlowLog{
+				policy: polprog.Rules{
+					NoProfileMatchID: 0xdead,
+					Tiers: []polprog.Tier{
+						{
+							Name: "pass",
+							Policies: []polprog.Policy{{
+								Name:  "pass rule",
+								Rules: []polprog.Rule{{Rule: &proto.Rule{Action: "Pass"}, MatchID: 1234}},
+							}},
+						},
+					},
+				},
+				droppedPackets: []testFlowLogCase{
+					{packet: udpPkt("10.0.0.1:31245", "10.0.0.2:80"), matches: []uint64{1234, 0xdead}},
+					{packet: tcpPkt("10.0.0.2:80", "10.0.0.1:31245"), matches: []uint64{1234, 0xdead}},
+					{packet: icmpPkt("10.0.0.1", "10.0.0.2"), matches: []uint64{1234, 0xdead}},
+				},
+			},
+		},
+		{
+			name: "different packets match different tiers and rules",
+			test: testFlowLog{
+				policy: polprog.Rules{
+					NoProfileMatchID: 0xdead,
+					Tiers: []polprog.Tier{
+						{
+							Name:      "first",
+							EndRuleID: 0xbeef,
+							Policies: []polprog.Policy{
+								{
+									Name: "TCP pass",
+									Rules: []polprog.Rule{{
+										MatchID: 6,
+										Rule: &proto.Rule{
+											Action: "Pass",
+											Protocol: &proto.Protocol{
+												NumberOrName: &proto.Protocol_Name{Name: "tcp"},
+											},
+										},
+									}},
+								},
+								{
+									Name: "UDP allow",
+									Rules: []polprog.Rule{{
+										MatchID: 17,
+										Rule: &proto.Rule{
+											Action: "Allow",
+											Protocol: &proto.Protocol{
+												NumberOrName: &proto.Protocol_Name{Name: "udp"},
+											},
+										},
+									}},
+								},
+								// Explicit deny rest
+							},
+						},
+						{
+							Name:      "tcp",
+							EndRuleID: 0xdeadbeef,
+							Policies: []polprog.Policy{
+								{
+									Name: "TCP ports",
+									Rules: []polprog.Rule{
+										{
+											MatchID: 80,
+											Rule: &proto.Rule{
+												Action:   "Pass",
+												DstPorts: []*proto.PortRange{{First: 80, Last: 80}},
+											},
+										},
+										{
+											MatchID: 443,
+											Rule: &proto.Rule{
+												Action:   "Allow",
+												DstPorts: []*proto.PortRange{{First: 443, Last: 443}},
+											},
+										},
+									},
+								},
+								{
+									Name: "UDP allow",
+									Rules: []polprog.Rule{{
+										MatchID: 17,
+										Rule: &proto.Rule{
+											Action: "Allow",
+											Protocol: &proto.Protocol{
+												NumberOrName: &proto.Protocol_Name{Name: "udp"},
+											},
+										},
+									}},
+								},
+								// Explicit deny rest
+							},
+						},
+						{
+							Name:      "http",
+							EndRuleID: 0xbad,
+							Policies: []polprog.Policy{
+								{
+									Name: "TCP ports",
+									Rules: []polprog.Rule{
+										{
+											MatchID: 10002,
+											Rule: &proto.Rule{
+												Action:      "Allow",
+												SrcIpSetIds: []string{"setFrom"},
+											},
+										},
+									},
+								},
+								// Explicit deny rest
+							},
+						},
+					},
+				},
+				ipSets: map[string][]string{
+					"setFrom": {"10.0.0.2/32"},
+				},
+				allowedPackets: []testFlowLogCase{
+					{packet: udpPkt("10.0.0.1:53", "10.0.0.2:53"), matches: []uint64{17}},
+					{packet: tcpPkt("10.0.0.2:1234", "10.0.0.1:80"), matches: []uint64{6, 80, 10002}},
+					{packet: tcpPkt("10.0.0.2:1234", "10.0.0.1:443"), matches: []uint64{6, 443}},
+				},
+				droppedPackets: []testFlowLogCase{
+					{packet: tcpPkt("10.0.0.2:8080", "10.0.0.1:31245"), matches: []uint64{6, 0xdeadbeef}},
+					{packet: icmpPkt("10.0.0.1", "10.0.0.2"), matches: []uint64{0xbeef}},
+					{packet: tcpPkt("10.0.0.3:1234", "10.0.0.1:80"), matches: []uint64{6, 80, 0xbad}},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("name=%s", test.name), func(t *testing.T) { runTest(t, test.test, polprog.WithFlowLogs()) })
+	}
+}
+
+func TestPolicyHostPolicyPrograms(t *testing.T) {
 	for i, p := range hostPolProgramTests {
-		if p.ForIPv6 {
-			// XXX skip for now
-			continue
-		}
 		t.Run(fmt.Sprintf("%d:Policy=%s", i, p.PolicyName), func(t *testing.T) { runTest(t, wrap(p)) })
 	}
 }
 
-func TestXDPPolicyPrograms(t *testing.T) {
+func TestPolicyXDPPolicyPrograms(t *testing.T) {
 	for i, p := range xdpPolProgramTests {
-		if p.ForIPv6 {
-			// XXX skip for now
-			continue
-		}
 		t.Run(fmt.Sprintf("%d:Policy=%s", i, p.PolicyName), func(t *testing.T) { runTest(t, wrap(p)) })
 	}
 }
@@ -2244,6 +2694,9 @@ type polProgramTest struct {
 	UnmatchedPackets []packet
 	IPSets           map[string][]string
 	ForIPv6          bool
+	SetupCB          func() error
+	TearDownCB       func() error
+	Options          []polprog.Option
 }
 
 type packet struct {
@@ -2355,7 +2808,13 @@ func (p packet) MatchStateOut(stateOut state.State) {
 
 	// Zero parts we do not care about
 	expectedStateOut.PolicyRC = 0 // PolicyRC tested by the caller
+	expectedStateOut.RulesHit = 0
+	expectedStateOut.RuleIDs = [state.MaxRuleIDs]uint64{}
+
 	stateOut.PolicyRC = 0
+	stateOut.RulesHit = 0
+	stateOut.RuleIDs = [state.MaxRuleIDs]uint64{}
+
 	Expect(stateOut).To(Equal(expectedStateOut), "policy program modified unexpected parts of the state")
 }
 
@@ -2375,7 +2834,7 @@ func ipUintFromString(addrStr string, section int) uint32 {
 	return binary.LittleEndian.Uint32(addrBytes[section*4 : (section+1)*4])
 }
 
-func TestIPUintFromString(t *testing.T) {
+func TestPolicyIPUintFromString(t *testing.T) {
 	RegisterTestingT(t)
 	Expect(ipUintFromString("10.0.0.1", 0)).To(Equal(uint32(0x0100000a)))
 	Expect(ipUintFromString("10.0.0.1", 1)).To(Equal(uint32(0)))
@@ -2396,6 +2855,8 @@ type testPolicy interface {
 	UnmatchedPackets() []testCase
 	XDP() bool
 	ForIPv6() bool
+	Setup() error
+	TearDown() error
 }
 
 type testCase interface {
@@ -2404,59 +2865,127 @@ type testCase interface {
 	MatchStateOut(stateOut state.State)
 }
 
-func runTest(t *testing.T, tp testPolicy) {
+var nextPolProgIdx atomic.Int64
+var jumpStride = asm.TrampolineStrideDefault
+
+func runTest(t *testing.T, tp testPolicy, polprogOpts ...polprog.Option) {
 	RegisterTestingT(t)
+
+	err := tp.Setup()
+	Expect(err).NotTo(HaveOccurred())
+
+	defer func() {
+		err := tp.TearDown()
+		Expect(err).NotTo(HaveOccurred())
+	}()
 
 	// The prog builder refuses to allocate IDs as a precaution, give it an allocator that forces allocations.
 	realAlloc := idalloc.New()
 	forceAlloc := &forceAllocator{alloc: realAlloc}
 
 	// Make sure the maps are available.
-	cleanIPSetMap()
 	// FIXME should clean up the maps at the end of each test but recreating the maps seems to be racy
+	if tp.ForIPv6() {
+		cleanIPSetMapV6()
+		setUpIPSetsV6(tp.IPSets(), realAlloc, ipsMapV6)
+	} else {
+		cleanIPSetMap()
+		setUpIPSets(tp.IPSets(), realAlloc, ipsMap)
+	}
 
-	setUpIPSets(tp.IPSets(), realAlloc, ipsMap)
+	for _, polJumpMap := range policyJumpMap {
+		if polJumpMap != nil {
+			_ = polJumpMap.Close()
+		}
+	}
 
-	jumpMap = jump.Map()
-	_ = unix.Unlink(jumpMap.Path())
-	err := jumpMap.EnsureExists()
+	policyJumpMap = jump.Maps()
+	for _, hk := range []hook.Hook{hook.Egress, hook.Ingress} {
+		_ = unix.Unlink(policyJumpMap[hk].Path())
+		err = policyJumpMap[hk].EnsureExists()
+		Expect(err).NotTo(HaveOccurred())
+	}
+
+	allowIdx := tcdefs.ProgIndexAllowed
+	denyIdx := tcdefs.ProgIndexDrop
+
+	ipsfd := ipsMap.MapFD()
+
+	polprogOpts = append(polprogOpts, polprog.WithAllowDenyJumps(allowIdx, denyIdx))
+
+	staticProgsMap := maps.NewPinnedMap(maps.MapParameters{
+		Type:       "prog_array",
+		KeySize:    4,
+		ValueSize:  4,
+		MaxEntries: 32,
+		Name:       "teststatic",
+	})
+	err = staticProgsMap.EnsureExists()
+	defer func() {
+		_ = staticProgsMap.Close()
+	}()
 	Expect(err).NotTo(HaveOccurred())
 
-	// Build the program.
-	pg := polprog.NewBuilder(forceAlloc, ipsMap.MapFD(), testStateMap.MapFD(), jumpMap.MapFD(),
-		polprog.WithAllowDenyJumps(tcdefs.ProgIndexAllowed, tcdefs.ProgIndexDrop))
+	polProgIdx := int(nextPolProgIdx.Add(1))
+	stride := jump.TCMaxEntryPoints
+	polprogOpts = append(polprogOpts, polprog.WithPolicyMapIndexAndStride(int(polProgIdx), stride))
+
+retry:
+	polprogOpts = append(polprogOpts, polprog.WithTrampolineStride(jumpStride))
+
 	if tp.ForIPv6() {
-		pg.EnableIPv6Mode()
+		polprogOpts = append(polprogOpts, polprog.WithIPv6())
+		ipsfd = ipsMapV6.MapFD()
 	}
+	pg := polprog.NewBuilder(
+		forceAlloc,
+		ipsfd,
+		testStateMap.MapFD(),
+		staticProgsMap.MapFD(),
+		policyJumpMap[hook.Ingress].MapFD(),
+		polprogOpts...,
+	)
 	insns, err := pg.Instructions(tp.Policy())
 	Expect(err).NotTo(HaveOccurred(), "failed to assemble program")
 
-	// Load the program into the kernel.  We don't pin it so it'll be removed when the
-	// test process exits (or by the defer).
-	polProgFD, err := bpf.LoadBPFProgramFromInsns(insns, "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
-	Expect(err).NotTo(HaveOccurred(), "failed to load program into the kernel")
-	Expect(polProgFD).NotTo(BeZero())
+	// Load the program(s) into the kernel.
+	var polProgFDs []bpf.ProgFD
 	defer func() {
-		err := polProgFD.Close()
-		Expect(err).NotTo(HaveOccurred())
+		var errs []error
+		for _, polProgFD := range polProgFDs {
+			err := polProgFD.Close()
+			if err != nil {
+				errs = append(errs, err)
+			}
+		}
+		Expect(errs).To(BeEmpty())
 	}()
+	for i, p := range insns {
+		polProgFD, err := bpf.LoadBPFProgramFromInsns(p, "calico_policy", "Apache-2.0", unix.BPF_PROG_TYPE_SCHED_CLS)
+		if err != nil && errors.Is(err, unix.ERANGE) && jumpStride == asm.TrampolineStrideDefault {
+			jumpStride = 14000
+			goto retry
+		}
+		Expect(err).NotTo(HaveOccurred(), "failed to load program into the kernel")
+		Expect(polProgFD).NotTo(BeZero())
+		polProgFDs = append(polProgFDs, polProgFD)
+		err = policyJumpMap[hook.Ingress].Update(
+			jump.Key(polprog.SubProgramJumpIdx(polProgIdx, i, stride)),
+			jump.Value(polProgFD.FD()),
+		)
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to add policy sub program %d/%d", i, len(insns)))
+	}
 
 	// Give the policy program somewhere to jump to.
-	jumpMapIndex := tcdefs.ProgIndexAllowed
-	if tp.ForIPv6() {
-		jumpMapIndex = tcdefs.ProgIndexV6Allowed
-	}
-	epiFD := installAllowedProgram(jumpMap, jumpMapIndex)
+	allowProgIdx := tcdefs.ProgIndexAllowed
+	epiFD := installAllowedProgram(staticProgsMap, allowProgIdx)
 	defer func() {
 		err := epiFD.Close()
 		Expect(err).NotTo(HaveOccurred())
 	}()
 
-	jumpMapIndex = tcdefs.ProgIndexDrop
-	if tp.ForIPv6() {
-		jumpMapIndex = tcdefs.ProgIndexV6Drop
-	}
-	dropFD := installDropProgram(jumpMap, jumpMapIndex)
+	dropProgIdx := tcdefs.ProgIndexDrop
+	dropFD := installDropProgram(staticProgsMap, dropProgIdx)
 	defer func() {
 		err := dropFD.Close()
 		Expect(err).NotTo(HaveOccurred())
@@ -2466,19 +2995,19 @@ func runTest(t *testing.T, tp testPolicy) {
 	for _, tc := range tp.AllowedPackets() {
 		t.Run(fmt.Sprintf("should allow %s", tc), func(t *testing.T) {
 			RegisterTestingT(t)
-			runProgram(tc, testStateMap, polProgFD, RCAllowedReached, state.PolicyAllow)
+			runProgram(tc, testStateMap, polProgFDs[0], RCAllowedReached, state.PolicyAllow)
 		})
 	}
 	for _, tc := range tp.DroppedPackets() {
 		t.Run(fmt.Sprintf("should drop %s", tc), func(t *testing.T) {
 			RegisterTestingT(t)
-			runProgram(tc, testStateMap, polProgFD, RCDropReached, state.PolicyDeny)
+			runProgram(tc, testStateMap, polProgFDs[0], RCDropReached, state.PolicyDeny)
 		})
 	}
 	for _, tc := range tp.UnmatchedPackets() {
 		t.Run(fmt.Sprintf("should not match %s", tc), func(t *testing.T) {
 			RegisterTestingT(t)
-			runProgram(tc, testStateMap, polProgFD, XDPPass, state.PolicyNoMatch)
+			runProgram(tc, testStateMap, polProgFDs[0], XDPPass, state.PolicyNoMatch)
 		})
 	}
 }
@@ -2560,7 +3089,18 @@ func setUpIPSets(ipSets map[string][]string, alloc *idalloc.IDAllocator, ipsMap 
 		id := alloc.GetOrAlloc(name)
 		for _, m := range members {
 			entry := ipsets.ProtoIPSetMemberToBPFEntry(id, m)
-			err := ipsMap.Update(entry[:], ipsets.DummyValue)
+			err := ipsMap.Update(entry.AsBytes(), ipsets.DummyValue)
+			Expect(err).NotTo(HaveOccurred())
+		}
+	}
+}
+
+func setUpIPSetsV6(ipSets map[string][]string, alloc *idalloc.IDAllocator, ipsMap maps.Map) {
+	for name, members := range ipSets {
+		id := alloc.GetOrAlloc(name)
+		for _, m := range members {
+			entry := ipsets.ProtoIPSetMemberToBPFEntryV6(id, m)
+			err := ipsMapV6.Update(entry.AsBytes(), ipsets.DummyValue)
 			Expect(err).NotTo(HaveOccurred())
 		}
 	}
@@ -2579,6 +3119,23 @@ func cleanIPSetMap() {
 	Expect(err).NotTo(HaveOccurred(), "failed to clean out map before test")
 	for _, k := range keys {
 		err = ipsMap.Delete(k)
+		Expect(err).NotTo(HaveOccurred(), "failed to clean out map before test")
+	}
+}
+
+func cleanIPSetMapV6() {
+	// Clean out any existing IP sets.  (The other maps have a fixed number of keys that
+	// we set as needed.)
+	var keys [][]byte
+	err := ipsMapV6.Iter(func(k, v []byte) maps.IteratorAction {
+		kCopy := make([]byte, len(k))
+		copy(kCopy, k)
+		keys = append(keys, kCopy)
+		return maps.IterNone
+	})
+	Expect(err).NotTo(HaveOccurred(), "failed to clean out map before test")
+	for _, k := range keys {
+		err = ipsMapV6.Delete(k)
 		Expect(err).NotTo(HaveOccurred(), "failed to clean out map before test")
 	}
 }

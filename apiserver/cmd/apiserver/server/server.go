@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 /*
 Copyright 2016 The Kubernetes Authors.
@@ -22,22 +22,19 @@ import (
 	"flag"
 	"io"
 
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
-
-	"github.com/projectcalico/calico/apiserver/pkg/apiserver"
-
 	"k8s.io/kubernetes/pkg/util/interrupt"
 
-	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/spf13/cobra"
-	"k8s.io/klog/v2"
+	"github.com/projectcalico/calico/apiserver/pkg/apiserver"
 )
 
 const defaultEtcdPathPrefix = ""
 
 // NewCommandStartMaster provides a CLI handler for 'start master' command
-func NewCommandStartCalicoServer(out io.Writer) (*cobra.Command, error) {
+func NewCommandStartCalicoServer(out io.Writer) (*cobra.Command, *CalicoServerOptions, error) {
 	//	o := NewCalicoServerOptions(out, errOut)
 
 	// Create the command that runs the API server
@@ -60,6 +57,8 @@ func NewCommandStartCalicoServer(out io.Writer) (*cobra.Command, error) {
 	opts.addFlags(flags)
 
 	cmd.Run = func(c *cobra.Command, args []string) {
+		configureLogging()
+
 		h := interrupt.New(nil, func() {
 			close(stopCh)
 		})
@@ -70,10 +69,10 @@ func NewCommandStartCalicoServer(out io.Writer) (*cobra.Command, error) {
 			}
 			return RunServer(opts, server)
 		}); err != nil {
-			klog.Fatalf("error running server (%s)", err)
+			logrus.Fatalf("error running server (%s)", err)
 			return
 		}
 	}
 
-	return cmd, nil
+	return cmd, opts, nil
 }

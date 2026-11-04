@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017,2019-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2023 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,8 +24,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/big"
 	"math/bits"
 	"net"
+	"net/netip"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -38,7 +40,7 @@ const (
 	IPv6SizeDword = 4
 )
 
-var ErrInvalidIP = errors.New("Failed to parse IP address")
+var ErrInvalidIP = errors.New("failed to parse IP address")
 
 // Addr represents either an IPv4 or IPv6 IP address.
 type Addr interface {
@@ -50,6 +52,8 @@ type Addr interface {
 	AsCalicoNetIP() calinet.IP
 	AsCIDR() CIDR
 	String() string
+	AsBinary() string
+	Add(int) Addr
 	NthBit(uint) int
 }
 
@@ -84,6 +88,31 @@ func (a V4Addr) NthBit(n uint) int {
 
 func (a V4Addr) String() string {
 	return a.AsNetIP().String()
+}
+
+func (a V4Addr) AsBinary() string {
+	var ipInBinary strings.Builder
+	fmt.Fprintf(&ipInBinary, "%04b", 4)
+	for ii := range net.IPv4len {
+		temp := fmt.Sprintf("%08b", a[ii])
+		ipInBinary.WriteString(temp)
+	}
+
+	return ipInBinary.String()
+}
+
+func (a V4Addr) Add(n int) Addr {
+	myValue := int(binary.BigEndian.Uint32(a[:]))
+	offsetValue := (uint32)(myValue + n)
+	var newAddr V4Addr
+	binary.BigEndian.PutUint32(newAddr[:], offsetValue)
+	return newAddr
+}
+
+func Int2NetIP(addr uint32) net.IP {
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, addr)
+	return ip
 }
 
 type V6Addr [16]byte
@@ -126,13 +155,44 @@ func (a V6Addr) String() string {
 	return a.AsNetIP().String()
 }
 
+func (a V6Addr) AsBinary() string {
+	var ipInBinary strings.Builder
+	fmt.Fprintf(&ipInBinary, "%04b", 6)
+	for ii := range net.IPv6len {
+		temp := fmt.Sprintf("%08b", a[ii])
+		ipInBinary.WriteString(temp)
+	}
+
+	return ipInBinary.String()
+}
+
+func (a V6Addr) Add(n int) Addr {
+	var myVal, nVal, newVal big.Int
+
+	myVal.SetBytes(a[:])
+	nVal.SetInt64(int64(n))
+	newVal.Add(&myVal, &nVal)
+
+	var newAddr V6Addr
+	b := newVal.Bytes()
+	bLen := len(b)
+	offset := len(a) - bLen
+	copy(newAddr[offset:], b)
+
+	return newAddr
+}
+
 type CIDR interface {
 	Version() uint8
 	Addr() Addr
 	Prefix() uint8
 	String() string
 	ToIPNet() net.IPNet
+	AsBinary() string
 	Contains(addr Addr) bool
+	// IsSingleAddress returns true if the CIDR represents a single address.
+	// I.e. a /32 for IPv4 or a /128 for IPv6.
+	IsSingleAddress() bool
 }
 
 type V4CIDR struct {
@@ -178,6 +238,21 @@ func (c V4CIDR) ContainsV4(addr V4Addr) bool {
 
 func (c V4CIDR) String() string {
 	return fmt.Sprintf("%s/%v", c.addr.String(), c.prefix)
+}
+
+func (c V4CIDR) AsBinary() string {
+	var ipInBinary strings.Builder
+	fmt.Fprintf(&ipInBinary, "%04b", 4)
+	for ii := range net.IPv4len {
+		temp := fmt.Sprintf("%08b", c.addr[ii])
+		ipInBinary.WriteString(temp)
+	}
+
+	return ipInBinary.String()[0 : c.prefix+4]
+}
+
+func (c V4CIDR) IsSingleAddress() bool {
+	return c.prefix == 32
 }
 
 type V6CIDR struct {
@@ -231,8 +306,28 @@ func (c V6CIDR) String() string {
 	return fmt.Sprintf("%s/%v", c.addr.String(), c.prefix)
 }
 
+func (c V6CIDR) AsBinary() string {
+	var ipInBinary strings.Builder
+	fmt.Fprintf(&ipInBinary, "%04b", 6)
+	for ii := range net.IPv6len {
+		temp := fmt.Sprintf("%08b", c.addr[ii])
+		ipInBinary.WriteString(temp)
+	}
+	return ipInBinary.String()[0 : c.prefix+4]
+}
+
+func (c V6CIDR) IsSingleAddress() bool {
+	return c.prefix == 128
+}
+
 func FromString(s string) Addr {
 	return FromNetIP(net.ParseIP(s))
+}
+
+// Parses an IP or CIDR string and returns the IP.
+func FromIPOrCIDRString(s string) Addr {
+	parts := strings.Split(s, "/")
+	return FromNetIP(net.ParseIP(parts[0]))
 }
 
 func FromNetIP(netIP net.IP) Addr {
@@ -264,11 +359,44 @@ func CIDRFromCalicoNet(ipNet calinet.IPNet) CIDR {
 	return CIDRFromIPNet(&ipNet.IPNet)
 }
 
+// CIDRFromPrefix converts a netip.Prefix to a CIDR.
+// The prefix is masked to ensure canonical representation.
+func CIDRFromPrefix(p netip.Prefix) CIDR {
+	p = p.Masked()
+	addr := p.Addr()
+	bits := p.Bits()
+	if addr.Is4() {
+		raw := addr.As4()
+		return V4CIDR{
+			addr:   V4Addr(raw),
+			prefix: uint8(bits),
+		}
+	}
+	raw := addr.As16()
+	return V6CIDR{
+		addr:   V6Addr(raw),
+		prefix: uint8(bits),
+	}
+}
+
+func CIDRsFromCalicoNets(ipNets []calinet.IPNet) []CIDR {
+	cidrs := make([]CIDR, 0, len(ipNets))
+	for _, ipNet := range ipNets {
+		cidrs = append(cidrs, CIDRFromCalicoNet(ipNet))
+	}
+	return cidrs
+}
+
 func FromCalicoIP(ip calinet.IP) Addr {
 	return FromNetIP(ip.IP)
 }
 
+// CIDRFromIPNet converts a *net.IPNet to a CIDR; if passed nil,
+// returns nil.
 func CIDRFromIPNet(ipNet *net.IPNet) CIDR {
+	if ipNet == nil {
+		return nil
+	}
 	ones, _ := ipNet.Mask.Size()
 	// Mask the IP before creating the CIDR so that we have it in canonical format.
 	ip := FromNetIP(ipNet.IP.Mask(ipNet.Mask))
@@ -298,6 +426,22 @@ func CIDRFromAddrAndPrefix(addr Addr, prefixLen int) CIDR {
 // CIDRFromNetIP converts the given IP into our CIDR representation as a /32 or /128.
 func CIDRFromNetIP(netIP net.IP) CIDR {
 	return FromNetIP(netIP).AsCIDR()
+}
+
+// CIDRFromIPOrIPNet converts the given net.IP or *net.IPNet to a CIDR
+type IPOrIPNet interface {
+	net.IP | *net.IPNet
+}
+
+func CIDRFromIPOrIPNet[T IPOrIPNet](v T) CIDR {
+	switch v := any(v).(type) {
+	case net.IP:
+		return CIDRFromNetIP(v)
+	case *net.IPNet:
+		return CIDRFromIPNet(v)
+	default:
+		return nil
+	}
 }
 
 // MustParseCIDROrIP parses the given IP address or CIDR, treating IP addresses as "full length"
@@ -337,4 +481,13 @@ func IPNetsEqual(net1, net2 *net.IPNet) bool {
 		return false
 	}
 	return CIDRFromIPNet(net1) == CIDRFromIPNet(net2)
+}
+
+func ParseIPAs16Byte(ip string) (ipb [16]byte, ok bool) {
+	ipn := net.ParseIP(ip)
+	if ipn != nil {
+		ok = true
+		copy(ipb[:], ipn.To16())
+	}
+	return
 }

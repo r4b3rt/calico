@@ -24,7 +24,7 @@ if ($env:CNI_IPAM_TYPE -EQ "host-local") {
   $env:USE_POD_CIDR = "false"
 }
 
-if($env:CALICO_NETWORKING_BACKEND = "windows-bgp")
+if($env:CALICO_NETWORKING_BACKEND -EQ "windows-bgp")
 {
   Wait-ForCalicoInit
   Write-Host "Windows BGP is enabled, running confd..."
@@ -38,11 +38,10 @@ if($env:CALICO_NETWORKING_BACKEND = "windows-bgp")
   rm blocks.ps1 -ErrorAction SilentlyContinue
 
   # Run the calico-confd binary.
-  & ..\calico-node.exe -confd -confd-confdir="$PSScriptRoot"
+  & ..\calico.exe component confd --confdir="$PSScriptRoot"
 } else {
   Write-Host "Windows BGP is disabled, not running confd."
   while($True) {
     Start-Sleep 10
   }
 }
-

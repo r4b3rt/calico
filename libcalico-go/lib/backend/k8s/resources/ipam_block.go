@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,17 +19,15 @@ import (
 	"fmt"
 	"reflect"
 
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	libapiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
@@ -39,27 +37,29 @@ import (
 
 const (
 	IPAMBlockResourceName = "IPAMBlocks"
-	IPAMBlockCRDName      = "ipamblocks.crd.projectcalico.org"
 )
 
-func NewIPAMBlockClient(c *kubernetes.Clientset, r *rest.RESTClient) K8sResourceClient {
+func NewIPAMBlockClient(r rest.Interface, group BackingAPIGroup) K8sResourceClient {
 	// Create a resource client which manages k8s CRDs.
-	rc := customK8sResourceClient{
-		clientSet:       c,
+	rc := customResourceClient{
 		restClient:      r,
-		name:            IPAMBlockCRDName,
 		resource:        IPAMBlockResourceName,
-		description:     "Calico IPAM blocks",
-		k8sResourceType: reflect.TypeOf(libapiv3.IPAMBlock{}),
-		k8sResourceTypeMeta: metav1.TypeMeta{
-			Kind:       libapiv3.KindIPAMBlock,
-			APIVersion: apiv3.GroupVersionCurrent,
-		},
-		k8sListType:  reflect.TypeOf(libapiv3.IPAMBlockList{}),
-		resourceKind: libapiv3.KindIPAMBlock,
+		k8sResourceType: reflect.TypeFor[internalapi.IPAMBlock](),
+		k8sListType:     reflect.TypeFor[internalapi.IPAMBlockList](),
+		kind:            internalapi.KindIPAMBlock,
+		apiGroup:        group,
 	}
 
-	return &ipamBlockClient{rc: rc}
+	if group == BackingAPIGroupV3 {
+		// If this is a v3 resource, then we need to use the v3 API types, as they differ.
+		rc.k8sResourceType = reflect.TypeFor[v3.IPAMBlock]()
+		rc.k8sListType = reflect.TypeFor[v3.IPAMBlockList]()
+	}
+
+	return &ipamBlockClient{
+		rc: rc,
+		v3: group == BackingAPIGroupV3,
+	}
 }
 
 // ipamBlockClient implements the api.Client interface for IPAMBlocks. It handles the translation between
@@ -67,102 +67,17 @@ func NewIPAMBlockClient(c *kubernetes.Clientset, r *rest.RESTClient) K8sResource
 // to actually store the data in the Kubernetes API. It uses a customK8sResourceClient under
 // the covers to perform CRUD operations on kubernetes CRDs.
 type ipamBlockClient struct {
-	rc customK8sResourceClient
-}
-
-func (c ipamBlockClient) toV1(kvpv3 *model.KVPair) (*model.KVPair, error) {
-	cidrStr := kvpv3.Value.(*libapiv3.IPAMBlock).Spec.CIDR
-	_, cidr, err := net.ParseCIDR(cidrStr)
-	if err != nil {
-		return nil, err
-	}
-
-	ab := kvpv3.Value.(*libapiv3.IPAMBlock)
-
-	// Convert attributes.
-	attrs := []model.AllocationAttribute{}
-	for _, a := range ab.Spec.Attributes {
-		attrs = append(attrs, model.AllocationAttribute{
-			AttrPrimary:   a.AttrPrimary,
-			AttrSecondary: a.AttrSecondary,
-		})
-	}
-
-	return &model.KVPair{
-		Key: model.BlockKey{
-			CIDR: *cidr,
-		},
-		Value: &model.AllocationBlock{
-			CIDR:                        *cidr,
-			Affinity:                    ab.Spec.Affinity,
-			Allocations:                 ab.Spec.Allocations,
-			Unallocated:                 ab.Spec.Unallocated,
-			Attributes:                  attrs,
-			Deleted:                     ab.Spec.Deleted,
-			SequenceNumber:              ab.Spec.SequenceNumber,
-			SequenceNumberForAllocation: ab.Spec.SequenceNumberForAllocation,
-		},
-		Revision: kvpv3.Revision,
-		UID:      &ab.UID,
-	}, nil
-}
-
-func (c ipamBlockClient) parseKey(k model.Key) (name, cidr string) {
-	cidr = fmt.Sprintf("%s", k.(model.BlockKey).CIDR)
-	name = names.CIDRToName(k.(model.BlockKey).CIDR)
-	return
-}
-
-func (c ipamBlockClient) toV3(kvpv1 *model.KVPair) *model.KVPair {
-	name, cidr := c.parseKey(kvpv1.Key)
-
-	ab := kvpv1.Value.(*model.AllocationBlock)
-
-	// Convert attributes.
-	attrs := []libapiv3.AllocationAttribute{}
-	for _, a := range ab.Attributes {
-		attrs = append(attrs, libapiv3.AllocationAttribute{
-			AttrPrimary:   a.AttrPrimary,
-			AttrSecondary: a.AttrSecondary,
-		})
-	}
-
-	return &model.KVPair{
-		Key: model.ResourceKey{
-			Name: name,
-			Kind: libapiv3.KindIPAMBlock,
-		},
-		Value: &libapiv3.IPAMBlock{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       libapiv3.KindIPAMBlock,
-				APIVersion: "crd.projectcalico.org/v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:            name,
-				ResourceVersion: kvpv1.Revision,
-			},
-			Spec: libapiv3.IPAMBlockSpec{
-				CIDR:                        cidr,
-				Allocations:                 ab.Allocations,
-				Unallocated:                 ab.Unallocated,
-				Affinity:                    ab.Affinity,
-				Attributes:                  attrs,
-				Deleted:                     ab.Deleted,
-				SequenceNumber:              ab.SequenceNumber,
-				SequenceNumberForAllocation: ab.SequenceNumberForAllocation,
-			},
-		},
-		Revision: kvpv1.Revision,
-	}
+	rc customResourceClient
+	v3 bool
 }
 
 func (c *ipamBlockClient) Create(ctx context.Context, kvp *model.KVPair) (*model.KVPair, error) {
-	nkvp := c.toV3(kvp)
+	nkvp := c.IPAMBlockV1toV3(kvp)
 	b, err := c.rc.Create(ctx, nkvp)
 	if err != nil {
 		return nil, err
 	}
-	v1kvp, err := c.toV1(b)
+	v1kvp, err := c.IPAMBlockV3toV1(b)
 	if err != nil {
 		return nil, err
 	}
@@ -170,12 +85,12 @@ func (c *ipamBlockClient) Create(ctx context.Context, kvp *model.KVPair) (*model
 }
 
 func (c *ipamBlockClient) Update(ctx context.Context, kvp *model.KVPair) (*model.KVPair, error) {
-	nkvp := c.toV3(kvp)
+	nkvp := c.IPAMBlockV1toV3(kvp)
 	b, err := c.rc.Update(ctx, nkvp)
 	if err != nil {
 		return nil, err
 	}
-	v1kvp, err := c.toV1(b)
+	v1kvp, err := c.IPAMBlockV3toV1(b)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +100,7 @@ func (c *ipamBlockClient) Update(ctx context.Context, kvp *model.KVPair) (*model
 func (c *ipamBlockClient) DeleteKVP(ctx context.Context, kvp *model.KVPair) (*model.KVPair, error) {
 	// We need to mark as deleted first, since the Kubernetes API doesn't support
 	// compare-and-delete. This update operation allows us to eliminate races with other clients.
-	name, _ := c.parseKey(kvp.Key)
+	name, _ := parseKey(kvp.Key)
 	kvp.Value.(*model.AllocationBlock).Deleted = true
 	v1kvp, err := c.Update(ctx, kvp)
 	if err != nil {
@@ -193,12 +108,12 @@ func (c *ipamBlockClient) DeleteKVP(ctx context.Context, kvp *model.KVPair) (*mo
 	}
 
 	// Now actually delete the object.
-	k := model.ResourceKey{Name: name, Kind: libapiv3.KindIPAMBlock}
+	k := model.ResourceKey{Name: name, Kind: internalapi.KindIPAMBlock}
 	kvp, err = c.rc.Delete(ctx, k, v1kvp.Revision, kvp.UID)
 	if err != nil {
 		return nil, err
 	}
-	return c.toV1(kvp)
+	return c.IPAMBlockV3toV1(kvp)
 }
 
 func (c *ipamBlockClient) Delete(ctx context.Context, key model.Key, revision string, uid *types.UID) (*model.KVPair, error) {
@@ -212,15 +127,15 @@ func (c *ipamBlockClient) Delete(ctx context.Context, key model.Key, revision st
 
 func (c *ipamBlockClient) Get(ctx context.Context, key model.Key, revision string) (*model.KVPair, error) {
 	// Get the object.
-	name, _ := c.parseKey(key)
-	k := model.ResourceKey{Name: name, Kind: libapiv3.KindIPAMBlock}
+	name, _ := parseKey(key)
+	k := model.ResourceKey{Name: name, Kind: internalapi.KindIPAMBlock}
 	kvp, err := c.rc.Get(ctx, k, revision)
 	if err != nil {
 		return nil, err
 	}
 
 	// Convert it back to V1 format.
-	v1kvp, err := c.toV1(kvp)
+	v1kvp, err := c.IPAMBlockV3toV1(kvp)
 	if err != nil {
 		return nil, err
 	}
@@ -238,15 +153,18 @@ func (c *ipamBlockClient) Get(ctx context.Context, key model.Key, revision strin
 }
 
 func (c *ipamBlockClient) List(ctx context.Context, list model.ListInterface, revision string) (*model.KVPairList, error) {
-	l := model.ResourceListOptions{Kind: libapiv3.KindIPAMBlock}
+	l := model.ResourceListOptions{Kind: internalapi.KindIPAMBlock}
 	v3list, err := c.rc.List(ctx, l, revision)
 	if err != nil {
 		return nil, err
 	}
 
-	kvpl := &model.KVPairList{KVPairs: []*model.KVPair{}}
+	kvpl := &model.KVPairList{
+		KVPairs:  []*model.KVPair{},
+		Revision: v3list.Revision,
+	}
 	for _, i := range v3list.KVPairs {
-		v1kvp, err := c.toV1(i)
+		v1kvp, err := c.IPAMBlockV3toV1(i)
 		if err != nil {
 			return nil, err
 		}
@@ -255,10 +173,11 @@ func (c *ipamBlockClient) List(ctx context.Context, list model.ListInterface, re
 	return kvpl, nil
 }
 
-func (c *ipamBlockClient) Watch(ctx context.Context, list model.ListInterface, revision string) (api.WatchInterface, error) {
-	resl := model.ResourceListOptions{Kind: libapiv3.KindIPAMBlock}
+func (c *ipamBlockClient) Watch(ctx context.Context, list model.ListInterface, options api.WatchOptions) (api.WatchInterface, error) {
+	resl := model.ResourceListOptions{Kind: internalapi.KindIPAMBlock}
 	k8sWatchClient := cache.NewListWatchFromClient(c.rc.restClient, c.rc.resource, "", fields.Everything())
-	k8sWatch, err := k8sWatchClient.WatchFunc(metav1.ListOptions{ResourceVersion: revision, AllowWatchBookmarks: false})
+	k8sOpts := watchOptionsToK8sListOptions(options)
+	k8sWatch, err := k8sWatchClient.WatchFunc(k8sOpts)
 	if err != nil {
 		return nil, K8sErrorToCalico(err, list)
 	}
@@ -267,7 +186,7 @@ func (c *ipamBlockClient) Watch(ctx context.Context, list model.ListInterface, r
 		if err != nil {
 			return nil, err
 		}
-		return c.toV1(conv)
+		return c.IPAMBlockV3toV1(conv)
 	}
 
 	return newK8sWatcherConverter(ctx, resl.Kind+" (custom)", toKVPair, k8sWatch), nil
@@ -277,4 +196,195 @@ func (c *ipamBlockClient) Watch(ctx context.Context, list model.ListInterface, r
 // initialized in advance.
 func (c *ipamBlockClient) EnsureInitialized() error {
 	return nil
+}
+
+func (c *ipamBlockClient) IPAMBlockV3toV1(kvpv3 *model.KVPair) (*model.KVPair, error) {
+	switch kvpv3.Value.(type) {
+	case *v3.IPAMBlock:
+		cidrStr := kvpv3.Value.(*v3.IPAMBlock).Spec.CIDR
+		_, cidr, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			return nil, err
+		}
+
+		ab := kvpv3.Value.(*v3.IPAMBlock)
+
+		// Convert attributes.
+		attrs := []model.AllocationAttribute{}
+		for _, a := range ab.Spec.Attributes {
+			attrs = append(attrs, model.AllocationAttribute{
+				HandleID:            a.HandleID,
+				ActiveOwnerAttrs:    a.ActiveOwnerAttrs,
+				AlternateOwnerAttrs: a.AlternateOwnerAttrs,
+				ReleasedAt:          a.ReleasedAt,
+			})
+		}
+
+		return &model.KVPair{
+			Key: model.BlockKey{
+				CIDR: model.PrefixFromIPNet(*cidr),
+			},
+			Value: &model.AllocationBlock{
+				CIDR:                        *cidr,
+				Affinity:                    ab.Spec.Affinity,
+				AffinityClaimTime:           ab.Spec.AffinityClaimTime,
+				Allocations:                 ab.Spec.Allocations,
+				Unallocated:                 ab.Spec.Unallocated,
+				Attributes:                  attrs,
+				Deleted:                     ab.Spec.Deleted,
+				SequenceNumber:              ab.Spec.SequenceNumber,
+				SequenceNumberForAllocation: ab.Spec.SequenceNumberForAllocation,
+			},
+			Revision: kvpv3.Revision,
+			UID:      &ab.UID,
+		}, nil
+	case *internalapi.IPAMBlock:
+		cidrStr := kvpv3.Value.(*internalapi.IPAMBlock).Spec.CIDR
+		_, cidr, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			return nil, err
+		}
+
+		ab := kvpv3.Value.(*internalapi.IPAMBlock)
+
+		// Convert attributes.
+		attrs := []model.AllocationAttribute{}
+		for _, a := range ab.Spec.Attributes {
+			attrs = append(attrs, model.AllocationAttribute{
+				HandleID:            a.HandleID,
+				ActiveOwnerAttrs:    a.ActiveOwnerAttrs,
+				AlternateOwnerAttrs: a.AlternateOwnerAttrs,
+				ReleasedAt:          a.ReleasedAt,
+			})
+		}
+
+		return &model.KVPair{
+			Key: model.BlockKey{
+				CIDR: model.PrefixFromIPNet(*cidr),
+			},
+			Value: &model.AllocationBlock{
+				CIDR:                        *cidr,
+				Affinity:                    ab.Spec.Affinity,
+				AffinityClaimTime:           ab.Spec.AffinityClaimTime,
+				Allocations:                 ab.Spec.Allocations,
+				Unallocated:                 ab.Spec.Unallocated,
+				Attributes:                  attrs,
+				Deleted:                     ab.Spec.Deleted,
+				SequenceNumber:              ab.Spec.SequenceNumber,
+				SequenceNumberForAllocation: ab.Spec.SequenceNumberForAllocation,
+			},
+			Revision: kvpv3.Revision,
+			UID:      &ab.UID,
+		}, nil
+	}
+	return nil, fmt.Errorf("unexpected type %T for IPAMBlock", kvpv3.Value)
+}
+
+func (c *ipamBlockClient) IPAMBlockV1toV3(kvpv1 *model.KVPair) *model.KVPair {
+	if c.v3 {
+		name, cidr := parseKey(kvpv1.Key)
+
+		ab := kvpv1.Value.(*model.AllocationBlock)
+
+		// Convert attributes.
+		attrs := []v3.AllocationAttribute{}
+		for _, a := range ab.Attributes {
+			attrs = append(attrs, v3.AllocationAttribute{
+				HandleID:            a.HandleID,
+				ActiveOwnerAttrs:    a.ActiveOwnerAttrs,
+				AlternateOwnerAttrs: a.AlternateOwnerAttrs,
+				ReleasedAt:          a.ReleasedAt,
+			})
+		}
+
+		apiVersion := "projectcalico.org/v3"
+
+		return &model.KVPair{
+			Key: model.ResourceKey{
+				Name: name,
+				Kind: internalapi.KindIPAMBlock,
+			},
+			Value: &v3.IPAMBlock{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       internalapi.KindIPAMBlock,
+					APIVersion: apiVersion,
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            name,
+					ResourceVersion: kvpv1.Revision,
+				},
+				Spec: v3.IPAMBlockSpec{
+					CIDR:                        cidr,
+					Allocations:                 ab.Allocations,
+					Unallocated:                 ab.Unallocated,
+					Affinity:                    ab.Affinity,
+					AffinityClaimTime:           ab.AffinityClaimTime,
+					Attributes:                  attrs,
+					Deleted:                     ab.Deleted,
+					SequenceNumber:              ab.SequenceNumber,
+					SequenceNumberForAllocation: ab.SequenceNumberForAllocation,
+				},
+			},
+			Revision: kvpv1.Revision,
+		}
+	} else {
+		name, cidr := parseKey(kvpv1.Key)
+
+		ab := kvpv1.Value.(*model.AllocationBlock)
+
+		// Convert attributes.
+		attrs := []internalapi.AllocationAttribute{}
+		for _, a := range ab.Attributes {
+			attrs = append(attrs, internalapi.AllocationAttribute{
+				HandleID:            a.HandleID,
+				ActiveOwnerAttrs:    a.ActiveOwnerAttrs,
+				AlternateOwnerAttrs: a.AlternateOwnerAttrs,
+				ReleasedAt:          a.ReleasedAt,
+			})
+		}
+
+		apiVersion := "crd.projectcalico.org/v1"
+
+		return &model.KVPair{
+			Key: model.ResourceKey{
+				Name: name,
+				Kind: internalapi.KindIPAMBlock,
+			},
+			Value: &internalapi.IPAMBlock{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       internalapi.KindIPAMBlock,
+					APIVersion: apiVersion,
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            name,
+					ResourceVersion: kvpv1.Revision,
+				},
+				Spec: internalapi.IPAMBlockSpec{
+					CIDR:                        cidr,
+					Allocations:                 ab.Allocations,
+					Unallocated:                 ab.Unallocated,
+					Affinity:                    ab.Affinity,
+					AffinityClaimTime:           ab.AffinityClaimTime,
+					Attributes:                  attrs,
+					Deleted:                     ab.Deleted,
+					SequenceNumber:              ab.SequenceNumber,
+					SequenceNumberForAllocation: ab.SequenceNumberForAllocation,
+				},
+			},
+			Revision: kvpv1.Revision,
+		}
+	}
+}
+
+func parseKey(k model.Key) (name, cidr string) {
+	cidr = k.(model.BlockKey).CIDR.Masked().String()
+	name = names.CIDRToName(model.IPNetFromPrefix(k.(model.BlockKey).CIDR))
+	return
+}
+
+// IPAMBlockV3toV1 converts an IPAMBlock KVPair to the v1 AllocationBlock model, for
+// callers that read blocks through an informer rather than the backend client.
+func IPAMBlockV3toV1(kvp *model.KVPair) (*model.KVPair, error) {
+	c := &ipamBlockClient{v3: false}
+	return c.IPAMBlockV3toV1(kvp)
 }

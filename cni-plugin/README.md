@@ -6,7 +6,7 @@
 
 <blockquote>
 Note that the documentation in this repo is targeted at Calico contributors.
-<h1>Documentation for Calico users is here:<br><a href="http://docs.projectcalico.org">http://docs.projectcalico.org</a></h1>
+<h1>Documentation for Calico users is here:<br><a href="https://docs.tigera.io/">https://docs.tigera.io/</a></h1>
 </blockquote>
 
 This repository contains the Project Calico network plugin for CNI.  This plugin allows you to use Calico networking for
@@ -31,5 +31,5 @@ To build the Calico Networking Plugin for CNI locally, clone this repository and
 
 Calico binaries are licensed under the [Apache v2.0 license](LICENSE), with the exception of some [GPL licensed eBPF programs](https://github.com/projectcalico/felix/tree/master/bpf-gpl).
 
-Calico imports packages with a number of apache-compatible licenses. For more information, see [filesystem/licenses](./licenses). In addition, the base container image contains
+Calico imports packages with a number of apache-compatible licenses. For more information, see [licenses](/licenses). In addition, the base container image contains
 pre-packaged software with a variety of licenses.

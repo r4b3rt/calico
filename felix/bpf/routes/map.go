@@ -20,7 +20,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf/maps"
@@ -33,6 +32,7 @@ func init() {
 
 func SetMapSize(size int) {
 	maps.SetSize(MapParameters.VersionedName(), size)
+	maps.SetSize(MapV6Parameters.VersionedName(), size)
 }
 
 // struct cali_rt_key {
@@ -43,8 +43,15 @@ const KeySize = 8
 
 type Key [KeySize]byte
 
+type KeyInterface interface {
+	Addr() ip.Addr
+	Dest() ip.CIDR
+	PrefixLen() int
+	AsBytes() []byte
+}
+
 func (k Key) Addr() ip.Addr {
-	var addr ip.V4Addr // FIXME IPv6
+	var addr ip.V4Addr
 	copy(addr[:], k[4:8])
 	return addr
 }
@@ -65,14 +72,18 @@ func (k Key) AsBytes() []byte {
 type Flags uint32
 
 const (
-	FlagInIPAMPool  Flags = 0x01
-	FlagNATOutgoing Flags = 0x02
-	FlagWorkload    Flags = 0x04
-	FlagLocal       Flags = 0x08
-	FlagHost        Flags = 0x10
-	FlagSameSubnet  Flags = 0x20
-	FlagTunneled    Flags = 0x40
-	FlagNoDSR       Flags = 0x80
+	FlagInIPAMPool       Flags = 0x01
+	FlagNATOutgoing      Flags = 0x02
+	FlagWorkload         Flags = 0x04
+	FlagLocal            Flags = 0x08
+	FlagHost             Flags = 0x10
+	FlagSameSubnet       Flags = 0x20
+	FlagTunneled         Flags = 0x40
+	FlagNoDSR            Flags = 0x80
+	FlagBlackHoleDrop    Flags = 0x100
+	FlagBlackHoleReject  Flags = 0x200
+	FlagVXLAN            Flags = 0x400
+	FlagSkipIngressRedir Flags = 0x800
 
 	FlagsUnknown            Flags = 0
 	FlagsRemoteWorkload           = FlagWorkload
@@ -85,6 +96,43 @@ const (
 	_ = FlagsUnknown
 )
 
+// FlagNames returns the human-readable names for the set bits in f.
+// The result is similar to Value.String() but returns a slice instead
+// of a single formatted string, and additionally includes FlagVXLAN.
+func (f Flags) FlagNames() []string {
+	var names []string
+
+	if f&FlagLocal != 0 {
+		names = append(names, "local")
+	} else if f&FlagBlackHoleDrop == 0 && f&FlagBlackHoleReject == 0 {
+		names = append(names, "remote")
+	}
+	if f&FlagHost != 0 {
+		names = append(names, "host")
+	} else if f&FlagWorkload != 0 {
+		names = append(names, "workload")
+	}
+	for _, pair := range []struct {
+		flag Flags
+		name string
+	}{
+		{FlagInIPAMPool, "in-pool"},
+		{FlagNATOutgoing, "nat-out"},
+		{FlagSameSubnet, "same-subnet"},
+		{FlagNoDSR, "no-dsr"},
+		{FlagTunneled, "tunneled"},
+		{FlagVXLAN, "vxlan"},
+		{FlagSkipIngressRedir, "skip-ingress-redir"},
+		{FlagBlackHoleDrop, "blackhole-drop"},
+		{FlagBlackHoleReject, "blackhole-reject"},
+	} {
+		if f&pair.flag != 0 {
+			names = append(names, pair.name)
+		}
+	}
+	return names
+}
+
 //	struct cali_rt_value {
 //	  __u32 flags;
 //	  union {
@@ -96,12 +144,20 @@ const ValueSize = 8
 
 type Value [ValueSize]byte
 
+type ValueInterface interface {
+	Flags() Flags
+	NextHop() ip.Addr
+	IfaceIndex() uint32
+	AsBytes() []byte
+	Equal(ValueInterface) bool
+}
+
 func (v Value) Flags() Flags {
 	return Flags(binary.LittleEndian.Uint32(v[:4]))
 }
 
 func (v Value) NextHop() ip.Addr {
-	var addr ip.V4Addr // FIXME IPv6
+	var addr ip.V4Addr
 	copy(addr[:], v[4:8])
 	return addr
 }
@@ -121,7 +177,7 @@ func (v Value) String() string {
 
 	if typeFlags&FlagLocal != 0 {
 		parts = append(parts, "local")
-	} else {
+	} else if typeFlags&FlagBlackHoleDrop == 0 && typeFlags&FlagBlackHoleReject == 0 {
 		parts = append(parts, "remote")
 	}
 
@@ -151,12 +207,24 @@ func (v Value) String() string {
 		parts = append(parts, "tunneled")
 	}
 
+	if typeFlags&FlagSkipIngressRedir != 0 {
+		parts = append(parts, "skip-ingress-redir")
+	}
+
 	if typeFlags&FlagLocal != 0 && typeFlags&FlagWorkload != 0 {
 		parts = append(parts, "idx", fmt.Sprint(v.IfaceIndex()))
 	}
 
 	if typeFlags&FlagLocal == 0 && typeFlags&FlagWorkload != 0 {
 		parts = append(parts, "nh", fmt.Sprint(v.NextHop()))
+	}
+
+	if typeFlags&FlagBlackHoleDrop != 0 {
+		parts = append(parts, "blackhole-drop")
+	}
+
+	if typeFlags&FlagBlackHoleReject != 0 {
+		parts = append(parts, "blackhole-reject")
 	}
 
 	if len(parts) == 0 {
@@ -166,7 +234,12 @@ func (v Value) String() string {
 	return strings.Join(parts, " ")
 }
 
-func NewKey(cidr ip.V4CIDR) Key {
+func (v Value) Equal(x ValueInterface) bool {
+	X, ok := x.(Value)
+	return ok && v == X
+}
+
+func NewKey(cidr ip.CIDR) Key {
 	var k Key
 
 	binary.LittleEndian.PutUint32(k[:4], uint32(cidr.Prefix()))
@@ -181,7 +254,7 @@ func NewValue(flags Flags) Value {
 	return v
 }
 
-func NewValueWithNextHop(flags Flags, nextHop ip.V4Addr) Value {
+func NewValueWithNextHop(flags Flags, nextHop ip.Addr) Value {
 	var v Value
 	binary.LittleEndian.PutUint32(v[:4], uint32(flags))
 	copy(v[4:8], nextHop.AsNetIP().To4())
@@ -192,6 +265,34 @@ func NewValueWithIfIndex(flags Flags, ifIndex int) Value {
 	var v Value
 	binary.LittleEndian.PutUint32(v[:4], uint32(flags))
 	binary.LittleEndian.PutUint32(v[4:8], uint32(ifIndex))
+	return v
+}
+
+func NewKeyIntf(cidr ip.CIDR) KeyInterface {
+	return NewKey(cidr)
+}
+
+func NewValueIntf(flags Flags) ValueInterface {
+	return NewValue(flags)
+}
+
+func NewValueIntfWithNextHop(flags Flags, nextHop ip.Addr) ValueInterface {
+	return NewValueWithNextHop(flags, nextHop)
+}
+
+func NewValueIntfWithIfIndex(flags Flags, ifIndex int) ValueInterface {
+	return NewValueWithIfIndex(flags, ifIndex)
+}
+
+func KeyInftFromBytes(b []byte) KeyInterface {
+	var k Key
+	copy(k[:], b)
+	return k
+}
+
+func ValueInftFromBytes(b []byte) ValueInterface {
+	var v Value
+	copy(v[:], b)
 	return v
 }
 
@@ -227,39 +328,29 @@ func LoadMap(rtm maps.Map) (MapMem, error) {
 	return m, err
 }
 
-type LPMv4 struct {
+type LPM struct {
 	sync.RWMutex
 	t *ip.CIDRTrie
 }
 
-func NewLPMv4() *LPMv4 {
-	return &LPMv4{
+func NewLPM() *LPM {
+	return &LPM{
 		t: ip.NewCIDRTrie(),
 	}
 }
 
-func (lpm *LPMv4) Update(k Key, v Value) error {
-	if cidrv4, ok := k.Dest().(ip.V4CIDR); ok {
-		lpm.t.Update(cidrv4, v)
-		return nil
-	}
-
-	return errors.Errorf("k.Dest() %+v type %T is not ip.V4CIDR", k.Dest(), k.Dest())
+func (lpm *LPM) Update(k KeyInterface, v ValueInterface) {
+	lpm.t.Update(k.Dest(), v)
 }
 
-func (lpm *LPMv4) Delete(k Key) error {
-	if cidrv4, ok := k.Dest().(ip.V4CIDR); ok {
-		lpm.t.Delete(cidrv4)
-		return nil
-	}
-
-	return errors.Errorf("k.Dest() %+v type %T is not ip.V4CIDR", k.Dest(), k.Dest())
+func (lpm *LPM) Delete(k KeyInterface) {
+	lpm.t.Delete(k.Dest())
 }
 
-func (lpm *LPMv4) Lookup(addr ip.V4Addr) (Value, bool) {
-	_, v := lpm.t.LPM(addr.AsCIDR().(ip.V4CIDR))
+func (lpm *LPM) Lookup(addr ip.Addr) (ValueInterface, bool) {
+	_, v := lpm.t.LPM(addr.AsCIDR())
 	if v == nil {
-		return Value{}, false
+		return nil, false
 	}
-	return v.(Value), true
+	return v.(ValueInterface), true
 }

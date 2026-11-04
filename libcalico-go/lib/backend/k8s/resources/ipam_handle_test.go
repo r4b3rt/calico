@@ -15,9 +15,10 @@
 package resources_test
 
 import (
-	. "github.com/onsi/ginkgo"
+	"context"
+
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"golang.org/x/net/context"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"

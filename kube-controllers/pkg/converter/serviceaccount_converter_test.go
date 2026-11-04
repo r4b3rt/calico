@@ -15,20 +15,17 @@
 package converter_test
 
 import (
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-
-	"github.com/projectcalico/calico/kube-controllers/pkg/converter"
-
 	k8sapi "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/projectcalico/calico/kube-controllers/pkg/converter"
 )
 
 var _ = Describe("ServiceAccount conversion tests", func() {
-
 	saConverter := converter.NewServiceAccountConverter()
 
 	It("should parse a Service Account to a Profile", func() {
@@ -40,6 +37,7 @@ var _ = Describe("ServiceAccount conversion tests", func() {
 					"roger":       "rabbit",
 				},
 				Annotations: map[string]string{},
+				UID:         "aa844ac0-87c8-440a-b270-307cdba8fd25",
 			},
 		}
 
@@ -73,6 +71,7 @@ var _ = Describe("ServiceAccount conversion tests", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        "serviceaccount",
 				Annotations: map[string]string{},
+				UID:         "aa844ac0-87c8-440a-b270-307cdba8fd25",
 			},
 		}
 		p, err := saConverter.Convert(&sa)
@@ -107,6 +106,7 @@ var _ = Describe("ServiceAccount conversion tests", func() {
 				Name:        "serviceaccount",
 				Namespace:   "foo",
 				Annotations: map[string]string{},
+				UID:         "aa844ac0-87c8-440a-b270-307cdba8fd25",
 			},
 		}
 		p, err := saConverter.Convert(&sa)
@@ -142,6 +142,7 @@ var _ = Describe("ServiceAccount conversion tests", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "serviceaccount",
 					Annotations: map[string]string{},
+					UID:         "aa844ac0-87c8-440a-b270-307cdba8fd25",
 				},
 			},
 		}
@@ -199,6 +200,5 @@ var _ = Describe("ServiceAccount conversion tests", func() {
 			Expect(sa).To(Equal(""))
 			Expect(name).To(Equal("ksa.default.serviceaccount"))
 		})
-
 	})
 })

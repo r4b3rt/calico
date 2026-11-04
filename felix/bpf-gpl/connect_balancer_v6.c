@@ -2,64 +2,61 @@
 // Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 
+/* Log prefix for this program.  log.h only defines CALI_LOG if it is not
+ * already set, so this must come before any include. */
+#define CALI_LOG(fmt, ...) bpf_log("CTLB-V6---------: " fmt, ## __VA_ARGS__)
+
 #include <linux/bpf.h>
 
-// socket_type.h contains the definition of SOCK_XXX constants that we need
-// but it's supposed to be imported via socket.h, which we can't import due
-// to lack of std lib support for BPF.  Bypass its check for now.
-#define _SYS_SOCKET_H
-#include <bits/socket_type.h>
-
-#include <stdbool.h>
-
-#include "bpf.h"
-#include "log.h"
-#include "globals.h"
-#include "ctlb.h"
-
-#include "sendrecv.h"
+#include "cali_bpf.h"
 #include "connect.h"
+#include "ctlb.h"
+#include "globals.h"
+#include "log.h"
+#include "sendrecv.h"
+#include "sock_type.h"
+
+#undef debug_ip
+
+#define IP_FMT "[%pI6]"
+#define debug_ip(ip) (&(ip))
 
 SEC("cgroup/connect6")
 int calico_connect_v6(struct bpf_sock_addr *ctx)
 {
-	int ret = 1;
-	__be32 ipv4;
+	CALI_DEBUG("calico_connect_v6");
 
-	CALI_DEBUG("connect_v6 ip[0-1] %x%x\n",
-			ctx->user_ip6[0],
-			ctx->user_ip6[1]);
-	CALI_DEBUG("connect_v6 ip[2-3] %x%x\n",
-			ctx->user_ip6[2],
-			ctx->user_ip6[3]);
+	ipv46_addr_t dst = {};
+	be32_4_ip_to_ipv6_addr_t(&dst, ctx->user_ip6);
 
-	/* check if it is a IPv4 mapped as IPv6 and if so, use the v4 table */
-	if (ctx->user_ip6[0] == 0 && ctx->user_ip6[1] == 0 &&
-			ctx->user_ip6[2] == bpf_htonl(0x0000ffff)) {
-		goto v4;
-	}
+	int ret = do_connect(ctx, &dst);
+	ipv6_addr_t_to_be32_4_ip(ctx->user_ip6, &dst);
 
-	CALI_DEBUG("connect_v6: not implemented for v6 yet\n");
-	goto out;
-
-v4:
-	ipv4 = ctx->user_ip6[3];
-
- 	if ((ret = connect_v4(ctx, &ipv4)) != 1) {
-		goto out;
-	}
-
-	ctx->user_ip6[3] = ipv4;
-
-out:
 	return ret;
 }
 
 SEC("cgroup/sendmsg6")
 int calico_sendmsg_v6(struct bpf_sock_addr *ctx)
 {
-	CALI_DEBUG("sendmsg_v6\n");
+	if (CTLB_EXCLUDE_UDP) {
+		goto out;
+	}
 
+	CALI_DEBUG("sendmsg_v6 " IP_FMT ":%d",
+			debug_ip(ctx->user_ip6), bpf_ntohl(ctx->user_port)>>16);
+
+	if (ctx->type != SOCK_DGRAM) {
+		CALI_INFO("unexpected sock type %d", ctx->type);
+		goto out;
+	}
+
+	ipv46_addr_t dst = {};
+	be32_4_ip_to_ipv6_addr_t(&dst, ctx->user_ip6);
+
+	do_nat_common(ctx, IPPROTO_UDP, &dst, false);
+	ipv6_addr_t_to_be32_4_ip(ctx->user_ip6, &dst);
+
+out:
 	return 1;
 }
 
@@ -70,45 +67,26 @@ int calico_recvmsg_v6(struct bpf_sock_addr *ctx)
 		goto out;
 	}
 
-	__be32 ipv4;
-
-	CALI_DEBUG("recvmsg_v6 ip[0-1] %x%x\n",
-			ctx->user_ip6[0],
-			ctx->user_ip6[1]);
-	CALI_DEBUG("recvmsg_v6 ip[2-3] %x%x\n",
-			ctx->user_ip6[2],
-			ctx->user_ip6[3]);
-
-	/* check if it is a IPv4 mapped as IPv6 and if so, use the v4 table */
-	if (ctx->user_ip6[0] == 0 && ctx->user_ip6[1] == 0 &&
-			ctx->user_ip6[2] == bpf_htonl(0x0000ffff)) {
-		goto v4;
-	}
-
-	CALI_DEBUG("recvmsg_v6: not implemented for v6 yet\n");
-	goto out;
-
-
-v4:
-	ipv4 = ctx->user_ip6[3];
-	CALI_DEBUG("recvmsg_v6 %x:%d\n", bpf_ntohl(ipv4), ctx_port_to_host(ctx->user_port));
+	CALI_DEBUG("recvmsg_v6 " IP_FMT ":%d", debug_ip(ctx->user_ip6), ctx_port_to_host(ctx->user_port));
 
 	if (ctx->type != SOCK_DGRAM) {
-		CALI_INFO("unexpected sock type %d\n", ctx->type);
+		CALI_INFO("unexpected sock type %d", ctx->type);
 		goto out;
 	}
 
-	struct sendrecv4_key key = {
-		.ip	= ipv4,
+	__u64 cookie = bpf_get_socket_cookie(ctx);
+	CALI_DEBUG("Lookup: ip=" IP_FMT " port=%d(BE) cookie=%x", debug_ip(ctx->user_ip6), ctx->user_port, cookie);
+	struct sendrec_key key = {
 		.port	= ctx->user_port,
-		.cookie	= bpf_get_socket_cookie(ctx),
+		.cookie	= cookie,
 	};
+	be32_4_ip_to_ipv6_addr_t(&key.ip, ctx->user_ip6);
 
-	struct sendrecv4_val *revnat = cali_v4_srmsg_lookup_elem(&key);
+	struct sendrec_val *revnat = cali_srmsg_lookup_elem(&key);
 
 	if (revnat == NULL) {
-		CALI_DEBUG("revnat miss for %x:%d\n",
-				bpf_ntohl(ipv4), ctx_port_to_host(ctx->user_port));
+		CALI_DEBUG("revnat miss for " IP_FMT ":%d",
+				debug_ip(ctx->user_ip6), ctx_port_to_host(ctx->user_port));
 		/* we are past policy and the packet was allowed. Either the
 		 * mapping does not exist anymore and if the app cares, it
 		 * should check the addresses. It is more likely a packet sent
@@ -117,10 +95,10 @@ v4:
 		goto out;
 	}
 
-	ctx->user_ip6[3] = revnat->ip;
+	ipv6_addr_t_to_be32_4_ip(ctx->user_ip6, &revnat->ip);
 	ctx->user_port = revnat->port;
-	CALI_DEBUG("recvmsg_v6 v4 rev nat to %x:%d\n",
-			bpf_ntohl(ipv4), ctx_port_to_host(ctx->user_port));
+	CALI_DEBUG("recvmsg_v6 rev nat to " IP_FMT ":%d",
+			debug_ip(ctx->user_ip6), ctx_port_to_host(ctx->user_port));
 
 out:
 	return 1;

@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,22 +16,44 @@ package infrastructure
 
 import (
 	"bufio"
+	"context"
 	"fmt"
+	"io"
+	"maps"
+	"net"
+	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
-	log "github.com/sirupsen/logrus"
+	"github.com/onsi/ginkgo/v2"
 
+	//nolint:staticcheck // Ignore ST1001: should not use dot imports
+	. "github.com/onsi/gomega"
+	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	"github.com/sirupsen/logrus"
+
+	"github.com/projectcalico/calico/felix/collector/flowlog"
+	"github.com/projectcalico/calico/felix/collector/goldmane"
+	"github.com/projectcalico/calico/felix/collector/local"
 	"github.com/projectcalico/calico/felix/fv/containers"
+	"github.com/projectcalico/calico/felix/fv/metrics"
 	"github.com/projectcalico/calico/felix/fv/tcpdump"
 	"github.com/projectcalico/calico/felix/fv/utils"
+	"github.com/projectcalico/calico/goldmane/pkg/types"
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/errors"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
 )
+
+var atomicCounter uint32
+
+var cwLogDir = os.Getenv("FV_CWLOGDIR")
 
 // FIXME: isolate individual Felix instances in their own cgroups.  Unfortunately, this doesn't work on systems that are using cgroupv1
 // see https://elixir.bootlin.com/linux/v5.3.11/source/include/linux/cgroup-defs.h#L788 for explanation.
@@ -56,6 +78,10 @@ type Felix struct {
 	// get assigned to the IPv6 Wireguard tunnel.  Filled in by SetExpectedWireguardV6TunnelAddr().
 	ExpectedWireguardV6TunnelAddr string
 
+	// PanicExpected If set to true by the test, disables some diags collection
+	// on Stop()
+	PanicExpected bool
+
 	// IP of the Typha that this Felix is using (if any).
 	TyphaIP string
 
@@ -65,6 +91,13 @@ type Felix struct {
 	startupDelayed bool
 	restartDelayed bool
 	Workloads      []workload
+
+	TopologyOptions TopologyOptions
+
+	uniqueName string
+	flowServer *local.FlowServer
+
+	infra DatastoreInfra
 }
 
 type workload interface {
@@ -76,37 +109,35 @@ type workload interface {
 
 func (f *Felix) GetFelixPID() int {
 	if f.startupDelayed {
-		log.Panic("GetFelixPID() called but startup is delayed")
+		logrus.Panic("GetFelixPID() called but startup is delayed")
 	}
 	if f.restartDelayed {
-		log.Panic("GetFelixPID() called but restart is delayed")
+		logrus.Panic("GetFelixPID() called but restart is delayed")
 	}
 	return f.GetSinglePID("calico-felix")
 }
 
 func (f *Felix) GetFelixPIDs() []int {
 	if f.startupDelayed {
-		log.Panic("GetFelixPIDs() called but startup is delayed")
+		logrus.Panic("GetFelixPIDs() called but startup is delayed")
 	}
 	if f.restartDelayed {
-		log.Panic("GetFelixPIDs() called but restart is delayed")
+		logrus.Panic("GetFelixPIDs() called but restart is delayed")
 	}
 	return f.GetPIDs("calico-felix")
 }
 
 func (f *Felix) TriggerDelayedStart() {
 	if !f.startupDelayed {
-		log.Panic("TriggerDelayedStart() called but startup wasn't delayed")
+		logrus.Panic("TriggerDelayedStart() called but startup wasn't delayed")
 	}
 	f.Exec("touch", "/start-trigger")
+	f.FlowServerStart()
 	f.startupDelayed = false
 }
 
 func RunFelix(infra DatastoreInfra, id int, options TopologyOptions) *Felix {
-	log.Info("Starting felix")
-	ipv6Enabled := fmt.Sprint(options.EnableIPv6)
-	bpfEnableIPv6 := fmt.Sprint(options.BPFEnableIPv6)
-
+	logrus.Info("Starting felix")
 	args := infra.GetDockerArgs()
 	args = append(args, "--privileged")
 
@@ -114,20 +145,23 @@ func RunFelix(infra DatastoreInfra, id int, options TopologyOptions) *Felix {
 	// are called concurrently with other instances of RunFelix so it's important to only
 	// read from options.*.
 	envVars := map[string]string{
-		// Enable core dumps.
-		"GOTRACEBACK": "crash",
-		"GORACE":      "history_size=2",
+		"GORACE": "history_size=2",
 		// Tell the wrapper to set the core file name pattern so we can find the dump.
 		"SET_CORE_PATTERN": "true",
 
+		"FELIX_HEALTHENABLED":            "true",
+		"FELIX_HEALTHHOST":               "0.0.0.0",
 		"FELIX_LOGSEVERITYSCREEN":        options.FelixLogSeverity,
+		"FELIX_LogDebugFilenameRegex":    options.FelixDebugFilenameRegex,
 		"FELIX_PROMETHEUSMETRICSENABLED": "true",
 		"FELIX_BPFLOGLEVEL":              "debug",
 		"FELIX_USAGEREPORTINGENABLED":    "false",
-		"FELIX_IPV6SUPPORT":              ipv6Enabled,
-		"FELIX_BPFIPV6SUPPORT":           bpfEnableIPv6,
+		"FELIX_IPV6SUPPORT":              fmt.Sprint(options.EnableIPv6),
 		// Disable log dropping, because it can cause flakes in tests that look for particular logs.
 		"FELIX_DEBUGDISABLELOGDROPPING": "true",
+	}
+	if options.FelixCoreDumpsEnabled {
+		envVars["FELIX_GOTRACEBACK"] = "crash"
 	}
 	// Collect the volumes for this container.
 	wd, err := os.Getwd()
@@ -135,9 +169,19 @@ func RunFelix(infra DatastoreInfra, id int, options TopologyOptions) *Felix {
 
 	arch := utils.GetSysArch()
 
+	// The FV container runs the combined calico binary mounted at
+	// /usr/local/bin/calico-felix; it dispatches to the felix subcommand via
+	// cobra (see felix/docker-image/calico-felix-wrapper). The cgo variant
+	// is used by default so BPF FV works without FV_BINARY being set.
 	fvBin := os.Getenv("FV_BINARY")
 	if fvBin == "" {
-		fvBin = fmt.Sprintf("bin/calico-felix-%s", arch)
+		fvBin = fmt.Sprintf("../cmd/calico/bin/calico-cgo-%s", arch)
+	}
+
+	if cwLogDir == "" {
+		wDir, err := os.Getwd()
+		Expect(err).NotTo(HaveOccurred())
+		cwLogDir = filepath.Join(wDir, "/cwlogs")
 	}
 	volumes := map[string]string{
 		path.Join(wd, "..", "bin"):        "/usr/local/bin",
@@ -151,10 +195,10 @@ func RunFelix(infra DatastoreInfra, id int, options TopologyOptions) *Felix {
 
 	if os.Getenv("FELIX_FV_ENABLE_BPF") == "true" {
 		if !options.TestManagesBPF {
-			log.Info("FELIX_FV_ENABLE_BPF=true, enabling BPF with env var")
+			logrus.Info("FELIX_FV_ENABLE_BPF=true, enabling BPF with env var")
 			envVars["FELIX_BPFENABLED"] = "true"
 		} else {
-			log.Info("FELIX_FV_ENABLE_BPF=true but test manages BPF state itself, not using env var")
+			logrus.Info("FELIX_FV_ENABLE_BPF=true but test manages BPF state itself, not using env var")
 		}
 
 		if CreateCgroupV2 {
@@ -162,22 +206,55 @@ func RunFelix(infra DatastoreInfra, id int, options TopologyOptions) *Felix {
 		}
 	}
 
+	// For FV, tell Felix to write CloudWatch logs to a file instead of to the real
+	// AWS API.  Whether logs are actually generated, at all, still depends on
+	// FELIX_CLOUDWATCHLOGSREPORTERENABLED; tests that want that should call
+	// EnableCloudWatchLogs().
+	uniqueName := fmt.Sprintf("%d-%d-%d", id, os.Getpid(), int(atomic.AddUint32(&atomicCounter, 1)))
+	volumes[cwLogDir] = "/cwlogs"
+
+	// It's fine to always create the directory for felix flow logs, if they
+	// aren't enabled the directory will just stay empty.
+	logDir := path.Join(cwLogDir, uniqueName)
+	Expect(os.MkdirAll(logDir, 0o777)).NotTo(HaveOccurred())
+	nodeLogDir := "/var/log/calico/flowlogs" // This path is used by file reporter
+
+	var flowServer *local.FlowServer
+	if options.FlowLogSource == FlowLogSourceLocalSocket {
+		nodeLogDir = local.SocketDir
+		flowServer = local.NewFlowServer(logDir)
+
+		if !options.DelayFelixStart {
+			if err := flowServer.Run(); err != nil {
+				logrus.WithError(err).Panic("Failed to start local flow server")
+			}
+		}
+	}
+
+	args = append(args, "-v", fmt.Sprintf("%v:%v", logDir, nodeLogDir))
+
+	if os.Getenv("FELIX_FV_NFTABLES") == "Enabled" {
+		logrus.Info("Enabling nftables with env var")
+		envVars["FELIX_NFTABLESMODE"] = "Enabled"
+	}
+
+	if strings.ToLower(os.Getenv("FELIX_FV_BPFATTACHTYPE")) == "tc" {
+		logrus.Info("Enabling TC with env var")
+		envVars["FELIX_BPFATTACHTYPE"] = "tc"
+	}
+
 	if options.DelayFelixStart {
 		envVars["DELAY_FELIX_START"] = "true"
 	}
 
-	for k, v := range options.ExtraEnvVars {
-		envVars[k] = v
-	}
+	maps.Copy(envVars, options.ExtraEnvVars)
 
 	for k, v := range envVars {
 		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
 	}
 
 	// Add in the volumes.
-	for k, v := range options.ExtraVolumes {
-		volumes[k] = v
-	}
+	maps.Copy(volumes, options.ExtraVolumes)
 	for k, v := range volumes {
 		args = append(args, "-v", fmt.Sprintf("%s:%s", k, v))
 	}
@@ -211,51 +288,130 @@ func RunFelix(infra DatastoreInfra, id int, options TopologyOptions) *Felix {
 		c.Exec("sysctl", "-w", "net.ipv6.conf.all.forwarding=0")
 	}
 
-	// Configure our model host to drop forwarded traffic by default.  Modern
-	// Kubernetes/Docker hosts now have this setting, and the consequence is that
-	// whenever Calico policy intends to allow a packet, it must explicitly ACCEPT
-	// that packet, not just allow it to pass through cali-FORWARD and assume it will
-	// be accepted by the rest of the chain.  Establishing that setting in this FV
-	// allows us to test that.
-	c.Exec("iptables",
-		"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
-		"-W", "100000", // How often to probe the lock in microsecs.
-		"-P", "FORWARD", "DROP")
+	if os.Getenv("FELIX_FV_NFTABLES") == "Enabled" {
+		// Flush all rules to make sure iptables doesn't interfere with nftables.
+		for _, table := range []string{"filter", "nat", "mangle", "raw"} {
+			c.Exec("iptables", "-F", "-t", table)
+		}
 
-	return &Felix{
-		Container:      c,
-		startupDelayed: options.DelayFelixStart,
+		// nftables mode requires that iptables be configured to allow by default. Otherwise, a default
+		// drop action will override any accept verdict made by nftables.
+		c.Exec("iptables",
+			"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
+			"-W", "100000", // How often to probe the lock in microsecs.
+			"-P", "FORWARD", "ACCEPT")
+	} else {
+		// Configure our model host to drop forwarded traffic by default.  Modern
+		// Kubernetes/Docker hosts now have this setting, and the consequence is that
+		// whenever Calico policy intends to allow a packet, it must explicitly ACCEPT
+		// that packet, not just allow it to pass through cali-FORWARD and assume it will
+		// be accepted by the rest of the chain.  Establishing that setting in this FV
+		// allows us to test that.
+		c.Exec("iptables",
+			"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
+			"-W", "100000", // How often to probe the lock in microsecs.
+			"-P", "FORWARD", "DROP")
 	}
+
+	f := &Felix{
+		Container:       c,
+		startupDelayed:  options.DelayFelixStart,
+		uniqueName:      uniqueName,
+		TopologyOptions: options,
+		flowServer:      flowServer,
+		infra:           infra,
+	}
+	// Register this Felix for teardown and diagnostics via infra.
+	infra.AddCleanup(f.Stop)
+	infra.RegisterFelix(f)
+	return f
 }
 
 func (f *Felix) Stop() {
+	if f == nil {
+		return
+	}
+	if BPFMode() && !f.PanicExpected {
+		err := f.ExecMayFail("calico-bpf", "connect-time", "clean")
+		if err != nil {
+			logrus.WithError(err).Warn("Failed to clean up BPF connect-time state")
+		}
+	}
 	if CreateCgroupV2 {
 		_ = f.ExecMayFail("rmdir", path.Join("/run/calico/cgroup/", f.Name))
 	}
+	f.FlowServerStop()
+
+	// Quiesce the neighbour tables before we free this container's network
+	// devices.  This works around a kernel use-after-free panic (observed on
+	// 6.17.0-1020-gcp) that reboots the test VM during teardown and flakes the
+	// FV suite.  When an unresolved ARP/ND neighbour times out, the kernel's
+	// neigh_invalidate() generates an ICMP "destination unreachable" for every
+	// packet still queued behind that neighbour
+	// (neigh_timer_handler -> arp_error_report -> ipv4_link_failure ->
+	// __icmp_send).  If the input device of a queued packet has already been
+	// torn down, __icmp_send -> icmp_route_lookup -> l3mdev_master_ifindex_rcu
+	// -> netdev_master_upper_dev_get_rcu dereferences the freed netdevice and
+	// panics in interrupt context.  Removing this container frees its veth (the
+	// docker0-bridged host side and the in-container side), so flushing the
+	// neighbour entries first drops any queued packets and cancels the
+	// retransmit timers, ensuring no timer can fire against a device we are
+	// about to free.  Best effort: teardown must not fail if these don't run.
+	f.drainNeighbours()
+
 	f.Container.Stop()
+
+	if ginkgo.CurrentSpecReport().Failed() {
+		Expect(f.DataRaces()).To(BeEmpty(), "Test FAILED and data races were detected in the logs at teardown.")
+	} else {
+		Expect(f.DataRaces()).To(BeEmpty(), "Test PASSED but data races were detected in the logs at teardown.")
+	}
+}
+
+// drainNeighbours flushes neighbour (ARP/ND) state that could otherwise
+// outlive this container's network devices.  See the call site in Stop() for
+// the kernel panic this avoids.
+//
+// On the host we flush only the entries for this container's own addresses
+// (rather than the whole table) so that batches running in parallel on the
+// same host - as `make fv` does locally - are not disturbed.  Inside the
+// container, which is about to be destroyed, we flush everything.  All calls
+// are best effort.
+func (f *Felix) drainNeighbours() {
+	if f.IP != "" {
+		_ = utils.RunMayFail("ip", "neigh", "flush", "to", f.IP)
+	}
+	if f.IPv6 != "" {
+		_ = utils.RunMayFail("ip", "-6", "neigh", "flush", "to", f.IPv6)
+	}
+	f.ExecBestEffort("ip", "neigh", "flush", "all")
+	f.ExecBestEffort("ip", "-6", "neigh", "flush", "all")
 }
 
 func (f *Felix) Restart() {
 	oldPID := f.GetFelixPID()
 	f.Exec("kill", "-HUP", fmt.Sprint(oldPID))
 	Eventually(f.GetFelixPID, "10s", "100ms").ShouldNot(Equal(oldPID))
+	f.FlowServerReset()
+	f.WaitForReady()
 }
 
 func (f *Felix) RestartWithDelayedStartup() func() {
 	if f.restartDelayed {
-		log.Panic("RestartWithDelayedStartup() called but restart was delayed already")
+		logrus.Panic("RestartWithDelayedStartup() called but restart was delayed already")
 	}
 	oldPID := f.GetFelixPID()
 	f.restartDelayed = true
 	f.Exec("touch", "/delay-felix-restart")
 	f.Exec("kill", "-HUP", fmt.Sprint(oldPID))
+	f.FlowServerReset()
 	triggerChan := make(chan struct{})
 
 	go func() {
-		defer GinkgoRecover()
+		defer ginkgo.GinkgoRecover()
 		select {
 		case <-time.After(time.Second * 30):
-			log.Panic("Restart with delayed startup timed out after 30s")
+			logrus.Panic("Restart with delayed startup timed out after 30s")
 		case <-triggerChan:
 			return
 		}
@@ -269,10 +425,10 @@ func (f *Felix) RestartWithDelayedStartup() func() {
 	}
 }
 
-func (f *Felix) SetEvn(env map[string]string) {
+func (f *Felix) SetEnv(env map[string]string) {
 	fn := "extra-env.sh"
 
-	file, err := os.OpenFile("./"+fn, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0644)
+	file, err := os.OpenFile("./"+fn, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0o644)
 	Expect(err).NotTo(HaveOccurred())
 
 	fw := bufio.NewWriter(file)
@@ -288,38 +444,203 @@ func (f *Felix) SetEvn(env map[string]string) {
 	Expect(err).NotTo(HaveOccurred())
 }
 
-// AttachTCPDump returns tcpdump attached to the container
-func (f *Felix) AttachTCPDump(iface string) *tcpdump.TCPDump {
-	return tcpdump.Attach(f.Container.Name, "", iface)
+func (f *Felix) Ready() (bool, error) {
+	var healthAddr string
+
+	// Some tests override the health host, guess the right address to use.
+	switch f.TopologyOptions.ExtraEnvVars["FELIX_HEALTHHOST"] {
+	case "::":
+		healthAddr = f.GetIPv6()
+	case "", "0.0.0.0":
+		healthAddr = f.GetIP()
+	default:
+		healthAddr = f.TopologyOptions.ExtraEnvVars["FELIX_HEALTHHOST"]
+	}
+
+	url := "http://" + net.JoinHostPort(healthAddr, "9099") + "/readiness"
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		logrus.WithError(err).Error("Forming HTTP request for readiness failed")
+		return false, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logrus.WithError(err).Warn("HTTP GET for readiness failed")
+		return false, err
+	}
+	ok := resp.StatusCode == http.StatusOK
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logrus.WithError(err).Warn("Failed to read response body")
+		return false, err
+	}
+	_ = resp.Body.Close()
+	if !ok {
+		return false, fmt.Errorf("felix is not ready: %s", string(body))
+	}
+	return ok, nil
 }
 
-func (f *Felix) ProgramIptablesDNAT(serviceIP, targetIP, chain string) {
-	f.Exec(
-		"iptables",
-		"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
-		"-W", "100000", // How often to probe the lock in microsecs.
-		"-t", "nat", "-A", chain,
-		"--destination", serviceIP,
-		"-j", "DNAT", "--to-destination", targetIP,
-	)
+func (f *Felix) WaitForReady() {
+	logrus.WithField("felix", f.Name).Info("Waiting for felix to be ready")
+	startTime := time.Now()
+	timeout := "10s"
+	if BPFMode() {
+		// BPF mode has to load BPF programs at startup, this can take a while
+		// when starting several felix nodes in parallel.
+		timeout = "90s"
+	}
+	EventuallyWithOffset(1, f.Ready, timeout, "100ms").Should(BeTrue(),
+		"Timed out waiting for Felix to become ready.")
+	logrus.WithField("felix", f.Name).Infof("Felix is ready after %s", time.Since(startTime))
+}
+
+func BPFMode() bool {
+	return os.Getenv("FELIX_FV_ENABLE_BPF") == "true"
+}
+
+// AttachTCPDump returns tcpdump attached to the container
+func (f *Felix) AttachTCPDump(iface string) *tcpdump.TCPDump {
+	return tcpdump.Attach(f.Name, "", iface)
+}
+
+func (f *Felix) ProgramIptablesDNAT(serviceIP, targetIP, chain string, ipv6 bool) {
+	if !ipv6 {
+		f.Exec(
+			"iptables",
+			"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
+			"-W", "100000", // How often to probe the lock in microsecs.
+			"-t", "nat", "-A", chain,
+			"--destination", serviceIP,
+			"-j", "DNAT", "--to-destination", targetIP,
+		)
+	} else {
+		f.Exec(
+			"ip6tables",
+			"-w", "10", // Retry this for 10 seconds, e.g. if something else is holding the lock
+			"-W", "100000", // How often to probe the lock in microsecs.
+			"-t", "nat", "-A", chain,
+			"-d", serviceIP,
+			"-j", "DNAT", "--to-destination", targetIP,
+		)
+	}
+}
+
+func (f *Felix) FlowServerStart() {
+	if f.flowServer != nil {
+		if err := f.flowServer.Run(); err != nil {
+			logrus.WithError(err).Panic("Failed to start local flow server")
+		}
+	}
+}
+
+func (f *Felix) FlowServerStop() {
+	if f.flowServer != nil {
+		f.flowServer.Flush()
+		f.flowServer.Stop()
+	}
+}
+
+func (f *Felix) FlowServerReset() {
+	if f.flowServer != nil {
+		f.flowServer.Flush()
+	}
+}
+
+func (f *Felix) AddCleanup(fn func()) {
+	f.infra.AddCleanup(fn)
+}
+
+func (f *Felix) FlowServerAddress() string {
+	if f.flowServer != nil {
+		return f.flowServer.Address()
+	}
+	return ""
+}
+
+func (f *Felix) FlowLogs() ([]flowlog.FlowLog, error) {
+	switch f.TopologyOptions.FlowLogSource {
+	case FlowLogSourceFile:
+		panic("not supported flow log reader")
+	case FlowLogSourceLocalSocket:
+		return f.FlowLogsFromLocalSocket()
+	default:
+		panic("unrecognized flow log source")
+	}
+}
+
+func (f *Felix) FlowLogsFromLocalSocket() ([]flowlog.FlowLog, error) {
+	if f.flowServer == nil {
+		return nil, fmt.Errorf("local flow server not started")
+	}
+	flows := f.flowServer.List()
+	if len(flows) == 0 {
+		return nil, fmt.Errorf("no flow log received yet")
+	}
+
+	var flogs []flowlog.FlowLog
+	for _, f := range flows {
+		flogs = append(flogs, goldmane.ConvertGoldmaneToFlowlog(types.FlowToProto(f)))
+	}
+	return flogs, nil
+}
+
+func (f *Felix) ProgramNftablesDNAT(serviceIP, targetIP string, chain string, ipv6 bool) {
+	// Configure where this DNAT should be applied.
+	var hook string
+	var prio string
+	switch chain {
+	case "OUTPUT":
+		hook = "output"
+		prio = "100"
+	case "PREROUTING":
+		hook = "prerouting"
+		prio = "-100"
+	default:
+		Expect(true).To(BeFalse(), "DNAT programming not supoorted for chain %s", chain)
+	}
+
+	// Create the table if needed.
+	if _, err := f.ExecOutput("nft", "list", "table", "inet", "services"); err != nil {
+		f.Exec("nft", "create", "table", "inet", "services")
+	}
+
+	// Create the base chain if needed.
+	if _, err := f.ExecOutput("nft", "list", "chain", "inet", "services", chain); err != nil {
+		f.Exec("nft", "add", "chain", "inet", "services", chain, fmt.Sprintf("{ type nat hook %s priority %s; }", hook, prio))
+	}
+
+	// Add the DNAT rule.
+	ipv := "ip"
+	if ipv6 {
+		ipv = "ip6"
+	}
+	f.Exec("nft", "add", "rule", "inet", "services", chain, ipv, "daddr", serviceIP, "counter dnat to", targetIP)
 }
 
 type BPFIfState struct {
-	IfIndex  int
-	Workload bool
-	Ready    bool
+	IfIndex         int
+	Workload        bool
+	V4Ready         bool
+	V6Ready         bool
+	IngressPolicyV4 int
+	EgressPolicyV4  int
+	IngressPolicyV6 int
+	EgressPolicyV6  int
 }
 
-var bpfIfStateRegexp = regexp.MustCompile(`.*([0-9]+) : \{flags: (.*) name: (.*)\}`)
+var bpfIfStateRegexp = regexp.MustCompile(`.*([0-9]+) : \{flags: (.*) name: (.*)}`)
 
-func (f *Felix) BPFIfState() map[string]BPFIfState {
+func (f *Felix) BPFIfState(family int) map[string]BPFIfState {
 	out, err := f.ExecOutput("calico-bpf", "ifstate", "dump")
 	Expect(err).NotTo(HaveOccurred())
 
 	states := make(map[string]BPFIfState)
 
-	lines := strings.Split(out, "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(out, "\n")
+	for line := range lines {
 		match := bpfIfStateRegexp.FindStringSubmatch(line)
 		if len(match) == 0 {
 			continue
@@ -327,15 +648,154 @@ func (f *Felix) BPFIfState() map[string]BPFIfState {
 
 		name := match[3]
 		flags := match[2]
+		if strings.Contains(flags, "notmanaged") {
+			continue
+		}
 		ifIndex, _ := strconv.Atoi(match[1])
+
+		inPolV4 := -1
+		outPolV4 := -1
+		inPolV6 := -1
+		outPolV6 := -1
+		if family == 4 {
+			r := regexp.MustCompile(`IngressPolicyV4: (\d+)`)
+			m := r.FindStringSubmatch(line)
+			inPolV4, _ = strconv.Atoi(m[1])
+			r = regexp.MustCompile(`EgressPolicyV4: (\d+)`)
+			m = r.FindStringSubmatch(line)
+			outPolV4, _ = strconv.Atoi(m[1])
+		} else {
+			r := regexp.MustCompile(`IngressPolicyV6: (\d+)`)
+			m := r.FindStringSubmatch(line)
+			inPolV6, _ = strconv.Atoi(m[1])
+			r = regexp.MustCompile(`EgressPolicyV6: (\d+)`)
+			m = r.FindStringSubmatch(line)
+			outPolV6, _ = strconv.Atoi(m[1])
+		}
+
 		state := BPFIfState{
-			IfIndex:  ifIndex,
-			Workload: strings.Contains(flags, "workload"),
-			Ready:    strings.Contains(flags, "ready"),
+			IfIndex:         ifIndex,
+			Workload:        strings.Contains(flags, "workload"),
+			V4Ready:         strings.Contains(flags, "v4Ready"),
+			V6Ready:         strings.Contains(flags, "v6Ready"),
+			IngressPolicyV4: inPolV4,
+			EgressPolicyV4:  outPolV4,
+			IngressPolicyV6: inPolV6,
+			EgressPolicyV6:  outPolV6,
 		}
 
 		states[name] = state
 	}
 
 	return states
+}
+
+func (f *Felix) BPFPolEntryPointIdx(iface string, ingressOrEgress string, family int) int {
+	ifState := f.BPFIfState(family)[iface]
+	var entryPointIdx int
+	if ingressOrEgress == "ingress" {
+		entryPointIdx = ifState.IngressPolicyV4
+		if family == 6 {
+			entryPointIdx = ifState.IngressPolicyV6
+		}
+	} else {
+		entryPointIdx = ifState.EgressPolicyV4
+		if family == 6 {
+			entryPointIdx = ifState.EgressPolicyV6
+		}
+	}
+	return entryPointIdx
+}
+
+func (f *Felix) IPTablesChains(table string) map[string][]string {
+	out := map[string][]string{}
+	raw, err := f.ExecOutput("iptables-save", "-t", table)
+	Expect(err).NotTo(HaveOccurred())
+	lines := strings.SplitSeq(raw, "\n")
+	for line := range lines {
+		if strings.HasPrefix(line, "#") {
+			// Line is a comment, ignore.
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			// A chain declaration line, for example:
+			// :cali-INPUT - [0:0]
+			chainName := strings.SplitN(line[1:], " ", 2)[0]
+			out[chainName] = []string{}
+			continue
+		}
+		if strings.HasPrefix(line, "-A") {
+			// "-A" means "append rule to chain".  For example:
+			// -A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+			chainName := strings.SplitN(line[3:], " ", 2)[0]
+			out[chainName] = append(out[chainName], line)
+			continue
+		}
+	}
+	return out
+}
+
+// AllCalicoIPTablesRules returns a flat slice of all 'cali-*' rules in a table.
+func (f *Felix) AllCalicoIPTablesRules(table string) []string {
+	chains := f.IPTablesChains(table)
+	var allRules []string
+	for _, chain := range chains {
+		for _, rule := range chain {
+			if strings.Contains(rule, "cali-") {
+				allRules = append(allRules, rule)
+			}
+		}
+	}
+
+	return allRules
+}
+
+func (f *Felix) PromMetric(name string) PrometheusMetric {
+	return PrometheusMetric{
+		f:    f,
+		Name: name,
+	}
+}
+
+type PrometheusMetric struct {
+	f    *Felix
+	Name string
+}
+
+func (p PrometheusMetric) Raw() (string, error) {
+	return metrics.GetFelixMetric(p.f.IP, p.Name)
+}
+
+func (p PrometheusMetric) Int() (int, error) {
+	raw, err := p.Raw()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(raw)
+}
+
+func (p PrometheusMetric) Float() (float64, error) {
+	raw, err := p.Raw()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseFloat(raw, 64)
+}
+
+func UpdateFelixConfiguration(client client.Interface, deltaFn func(*api.FelixConfiguration)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cfg, err := client.FelixConfigurations().Get(ctx, "default", options.GetOptions{})
+	if _, doesNotExist := err.(errors.ErrorResourceDoesNotExist); doesNotExist {
+		cfg = api.NewFelixConfiguration()
+		cfg.Name = "default"
+		deltaFn(cfg)
+		_, err = client.FelixConfigurations().Create(ctx, cfg, options.SetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+	} else {
+		Expect(err).NotTo(HaveOccurred())
+		deltaFn(cfg)
+		_, err = client.FelixConfigurations().Update(ctx, cfg, options.SetOptions{})
+		Expect(err).NotTo(HaveOccurred())
+	}
 }

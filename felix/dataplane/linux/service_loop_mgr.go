@@ -17,7 +17,7 @@ package intdataplane
 import (
 	"reflect"
 
-	"github.com/projectcalico/calico/felix/iptables"
+	"github.com/projectcalico/calico/felix/generictables"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/rules"
 )
@@ -29,22 +29,22 @@ import (
 // it's better for us to drop it, to avoid a possible routing loop between this node and this node's
 // default gateway.  The specific loop-generating scenario is when Calico is configured to advertise
 // service CIDRs and IPs over BGP: then the default gateway will have a route back to this node, for
-// the service CIDR, and there could be a loop if we allowed non-existent service traffic to be
+// the service CIDR, and there could be a loop if we allowed nonexistent service traffic to be
 // forwarded on from here.
 type serviceLoopManager struct {
 	ipVersion uint8
 
 	// Our dependencies.
-	filterTable  IptablesTable
+	filterTable  Table
 	ruleRenderer rules.RuleRenderer
 
 	// Internal state.
-	activeFilterChains     []*iptables.Chain
+	activeFilterChains     []*generictables.Chain
 	pendingGlobalBGPConfig *proto.GlobalBGPConfigUpdate
 }
 
 func newServiceLoopManager(
-	filterTable IptablesTable,
+	filterTable Table,
 	ruleRenderer rules.RuleRenderer,
 	ipVersion uint8,
 ) *serviceLoopManager {
@@ -52,12 +52,12 @@ func newServiceLoopManager(
 		ipVersion:              ipVersion,
 		filterTable:            filterTable,
 		ruleRenderer:           ruleRenderer,
-		activeFilterChains:     []*iptables.Chain{},
+		activeFilterChains:     []*generictables.Chain{},
 		pendingGlobalBGPConfig: &proto.GlobalBGPConfigUpdate{},
 	}
 }
 
-func (m *serviceLoopManager) OnUpdate(protoBufMsg interface{}) {
+func (m *serviceLoopManager) OnUpdate(protoBufMsg any) {
 	switch msg := protoBufMsg.(type) {
 	case *proto.GlobalBGPConfigUpdate:
 		m.pendingGlobalBGPConfig = msg

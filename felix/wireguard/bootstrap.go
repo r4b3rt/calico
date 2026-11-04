@@ -29,7 +29,7 @@ import (
 
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/netlinkshim"
-	apiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/options"
@@ -63,7 +63,7 @@ import (
 //
 // Since Felix1 does not necessarily connect to its local typha, there can be a chain, or circular mismatched routing.
 //
-// The current solution. For the most part, most of the following is only valid when HostEncrytpionEnabled is set to
+// The current solution. For the most part, most of the following is only valid when HostEncryptionEnabled is set to
 // true. There are some exceptions which are marked in the text below with [**ALL**].
 // -  Typha discovery returns the set of available typhas, randomized but with a preference to use the local typha.
 //    In most cases, felix will connect to the local typha first. The upshot is that the routing for typha nodes
@@ -103,7 +103,7 @@ const (
 	bootstrapJitter             = 0.2
 	bootstrapMaxRetriesFailFast = 2
 	bootstrapMaxRetries         = 5
-	boostrapK8sClientTimeout    = 10 * time.Second
+	bootstrapK8sClientTimeout   = 10 * time.Second
 )
 
 // BootstrapAndFilterTyphaAddresses performs wireguard bootstrap processing and filtering of typha addresses. This is
@@ -253,7 +253,7 @@ func bootstrapAndFilterTyphaAddressesForIPVersion(
 		if len(filtered) == 0 {
 			// We have filtered out all of the typha endpoints, i.e. with our current wireguard configuration none of
 			// the typhas will be accessible due to asymmetric routing. Best thing to do is just delete our wireguard
-			// configuration after which all of the typha endpoints should eventually become acceessible.
+			// configuration after which all of the typha endpoints should eventually become accessible.
 			logCtx.Warning("None of the typhas will be accessible due to wireguard routing asymmetry - remove wireguard")
 			return typhas, removeWireguardForBootstrapping(configParams, getNetlinkHandle, calicoClient, ipVersion)
 		}
@@ -413,6 +413,7 @@ func removeWireguardForBootstrapping(
 
 // getPublicKeyForNode returns the configured wireguard public key for a given node.
 func getPublicKeyForNode(logCtx *log.Entry, nodeName string, calicoClient clientv3.NodesClient, maxRetries int, ipVersion uint8) (string, error) {
+	//nolint:staticcheck // Ignore SA1019 deprecated
 	expBackoffMgr := wait.NewExponentialBackoffManager(
 		bootstrapBackoffDuration,
 		bootstrapBackoffMax,
@@ -428,9 +429,9 @@ func getPublicKeyForNode(logCtx *log.Entry, nodeName string, calicoClient client
 	defer expBackoffMgr.Backoff().Stop()
 
 	var err error
-	var node *apiv3.Node
-	for r := 0; r < maxRetries; r++ {
-		cxt, cancel := context.WithTimeout(context.Background(), boostrapK8sClientTimeout)
+	var node *internalapi.Node
+	for range maxRetries {
+		cxt, cancel := context.WithTimeout(context.Background(), bootstrapK8sClientTimeout)
 		node, err = calicoClient.Nodes().Get(cxt, nodeName, options.GetOptions{})
 		cancel()
 		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
@@ -522,6 +523,7 @@ func removeWireguardDevice(
 
 	logCtx.Debug("Removing wireguard device")
 
+	//nolint:staticcheck // Ignore SA1019 deprecated
 	expBackoffMgr := wait.NewExponentialBackoffManager(
 		bootstrapBackoffDuration,
 		bootstrapBackoffMax,
@@ -535,7 +537,7 @@ func removeWireguardDevice(
 	// Make a few attempts to delete the wireguard device.
 	var err error
 	var handle netlinkshim.Interface
-	for r := 0; r < bootstrapMaxRetries; r++ {
+	for range bootstrapMaxRetries {
 		if handle == nil {
 			if handle, err = getNetlinkHandle(); err != nil {
 				<-expBackoffMgr.Backoff().C()
@@ -570,6 +572,7 @@ func removeWireguardPublicKey(
 		return fmt.Errorf("unknown IP version: %d", ipVersion)
 	}
 
+	//nolint:staticcheck // Ignore SA1019 deprecated
 	expBackoffMgr := wait.NewExponentialBackoffManager(
 		bootstrapBackoffDuration,
 		bootstrapBackoffMax,
@@ -582,9 +585,9 @@ func removeWireguardPublicKey(
 
 	// Make a few attempts to remove the public key from the datastore.
 	var err error
-	var thisNode *apiv3.Node
-	for r := 0; r < bootstrapMaxRetries; r++ {
-		cxt, cancel := context.WithTimeout(context.Background(), boostrapK8sClientTimeout)
+	var thisNode *internalapi.Node
+	for range bootstrapMaxRetries {
+		cxt, cancel := context.WithTimeout(context.Background(), bootstrapK8sClientTimeout)
 		thisNode, err = calicoClient.Nodes().Get(cxt, nodeName, options.GetOptions{})
 		cancel()
 		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
@@ -606,7 +609,7 @@ func removeWireguardPublicKey(
 			case 6:
 				thisNode.Status.WireguardPublicKeyV6 = ""
 			}
-			cxt, cancel = context.WithTimeout(context.Background(), boostrapK8sClientTimeout)
+			cxt, cancel = context.WithTimeout(context.Background(), bootstrapK8sClientTimeout)
 			_, err = calicoClient.Nodes().Update(cxt, thisNode, options.SetOptions{})
 			cancel()
 			if err != nil {

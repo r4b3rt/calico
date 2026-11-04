@@ -20,9 +20,8 @@ import (
 	"net"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf/maps"
 	"github.com/projectcalico/calico/felix/ip"
@@ -34,12 +33,26 @@ func init() {
 	maps.SetSize(AffinityMapParameters.VersionedName(), AffinityMapParameters.MaxEntries)
 	maps.SetSize(SendRecvMsgMapParameters.VersionedName(), SendRecvMsgMapParameters.MaxEntries)
 	maps.SetSize(CTNATsMapParameters.VersionedName(), CTNATsMapParameters.MaxEntries)
+	maps.SetSize(MaglevMapParameters.VersionedName(), MaglevMapParameters.MaxEntries)
+
+	maps.SetSize(FrontendMapV6Parameters.VersionedName(), FrontendMapV6Parameters.MaxEntries)
+	maps.SetSize(BackendMapV6Parameters.VersionedName(), BackendMapV6Parameters.MaxEntries)
+	maps.SetSize(AffinityMapV6Parameters.VersionedName(), AffinityMapV6Parameters.MaxEntries)
+	maps.SetSize(SendRecvMsgMapV6Parameters.VersionedName(), SendRecvMsgMapV6Parameters.MaxEntries)
+	maps.SetSize(CTNATsMapV6Parameters.VersionedName(), CTNATsMapV6Parameters.MaxEntries)
+	maps.SetSize(MaglevMapV6Parameters.VersionedName(), MaglevMapV6Parameters.MaxEntries)
 }
 
-func SetMapSizes(fsize, bsize, asize int) {
+func SetMapSizes(fsize, bsize, asize, msize int) {
 	maps.SetSize(FrontendMapParameters.VersionedName(), fsize)
 	maps.SetSize(BackendMapParameters.VersionedName(), bsize)
 	maps.SetSize(AffinityMapParameters.VersionedName(), asize)
+	maps.SetSize(MaglevMapParameters.VersionedName(), msize)
+
+	maps.SetSize(FrontendMapV6Parameters.VersionedName(), fsize)
+	maps.SetSize(BackendMapV6Parameters.VersionedName(), bsize)
+	maps.SetSize(AffinityMapV6Parameters.VersionedName(), asize)
+	maps.SetSize(MaglevMapV6Parameters.VersionedName(), msize)
 }
 
 //	struct calico_nat_v4_key {
@@ -84,6 +97,9 @@ const backendValueSize = 8
 
 const BlackHoleCount uint32 = 0xffffffff
 
+// NodePortVXLANTunnelVNI is CALI_VXLAN_VNI in nat_types.h, the VNI that BPF uses to forward NodePort traffic.
+const NodePortVXLANTunnelVNI uint32 = 0xca11c0
+
 // (sizeof(addr) + sizeof(port) + sizeof(proto)) in bits
 const ZeroCIDRPrefixLen = 56
 
@@ -91,11 +107,31 @@ var ZeroCIDR = ip.MustParseCIDROrIP("0.0.0.0/0").(ip.V4CIDR)
 
 type FrontendKey [frontendKeySize]byte
 
+type FrontendKeyInterface interface {
+	Proto() uint8
+	Addr() net.IP
+	Port() uint16
+	SrcPrefixLen() uint32
+	SrcCIDR() ip.CIDR
+	AffinityKeyCopy() FrontEndAffinityKeyInterface
+	String() string
+	AsBytes() []byte
+}
+
+type FrontendKeyComparable interface {
+	comparable
+	FrontendKeyInterface
+}
+
 func NewNATKey(addr net.IP, port uint16, protocol uint8) FrontendKey {
 	return NewNATKeySrc(addr, port, protocol, ZeroCIDR)
 }
 
-func NewNATKeySrc(addr net.IP, port uint16, protocol uint8, cidr ip.V4CIDR) FrontendKey {
+func NewNATKeyIntf(addr net.IP, port uint16, protocol uint8) FrontendKeyInterface {
+	return NewNATKey(addr, port, protocol)
+}
+
+func NewNATKeySrc(addr net.IP, port uint16, protocol uint8, cidr ip.CIDR) FrontendKey {
 	var k FrontendKey
 	prefixlen := ZeroCIDRPrefixLen
 	addr = addr.To4()
@@ -108,6 +144,10 @@ func NewNATKeySrc(addr net.IP, port uint16, protocol uint8, cidr ip.V4CIDR) Fron
 	k[10] = protocol
 	copy(k[11:15], cidr.Addr().AsNetIP().To4())
 	return k
+}
+
+func NewNATKeySrcIntf(addr net.IP, port uint16, protocol uint8, cidr ip.CIDR) FrontendKeyInterface {
+	return NewNATKeySrc(addr, port, protocol, cidr)
 }
 
 func (k FrontendKey) Proto() uint8 {
@@ -149,11 +189,17 @@ func (k FrontendKey) Affinitykey() []byte {
 	return k[4:12]
 }
 
+func (k FrontendKey) AffinityKeyCopy() FrontEndAffinityKeyInterface {
+	var affkey FrontEndAffinityKey
+	copy(affkey[:], k.Affinitykey())
+	return affkey
+}
+
 func (k FrontendKey) String() string {
 	return fmt.Sprintf("NATKey{Proto:%v Addr:%v Port:%v SrcAddr:%v}", k.Proto(), k.Addr(), k.Port(), k.SrcCIDR())
 }
 
-func FrontendKeyFromBytes(b []byte) FrontendKey {
+func FrontendKeyFromBytes(b []byte) FrontendKeyInterface {
 	var k FrontendKey
 	copy(k[:], b)
 	return k
@@ -162,11 +208,15 @@ func FrontendKeyFromBytes(b []byte) FrontendKey {
 const (
 	NATFlgExternalLocal = 0x1
 	NATFlgInternalLocal = 0x2
+	NATFlgExclude       = 0x4
+	NATFlgMaglev        = 0x8
 )
 
 var flgTostr = map[int]string{
 	NATFlgExternalLocal: "external-local",
 	NATFlgInternalLocal: "internal-local",
+	NATFlgExclude:       "nat-exclude",
+	NATFlgMaglev:        "maglev",
 }
 
 type FrontendValue [frontendValueSize]byte
@@ -211,16 +261,20 @@ func (v FrontendValue) FlagsAsString() string {
 	flgs := v.Flags()
 	fstr := ""
 
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		flg := uint32(1 << i)
 		if flgs&flg != 0 {
 			fstr += flgTostr[int(flg)]
+			fstr += ", "
 		}
 		flgs &= ^flg
 		if flgs == 0 {
 			break
 		}
-		fstr += ", "
+	}
+
+	if fstr != "" {
+		return fstr[:len(fstr)-2]
 	}
 
 	return fstr
@@ -274,6 +328,13 @@ func BackendKeyFromBytes(b []byte) BackendKey {
 
 type BackendValue [backendValueSize]byte
 
+type BackendValueInterface interface {
+	Addr() net.IP
+	Port() uint16
+	String() string
+	AsBytes() []byte
+}
+
 func NewNATBackendValue(addr net.IP, port uint16) BackendValue {
 	var k BackendValue
 	addr = addr.To4()
@@ -283,6 +344,10 @@ func NewNATBackendValue(addr net.IP, port uint16) BackendValue {
 	copy(k[:4], addr)
 	binary.LittleEndian.PutUint16(k[4:6], port)
 	return k
+}
+
+func NewNATBackendValueIntf(addr net.IP, port uint16) BackendValueInterface {
+	return NewNATBackendValue(addr, port)
 }
 
 func (k BackendValue) Addr() net.IP {
@@ -301,10 +366,131 @@ func (k BackendValue) AsBytes() []byte {
 	return k[:]
 }
 
-func BackendValueFromBytes(b []byte) BackendValue {
+func BackendValueFromBytes(b []byte) BackendValueInterface {
 	var v BackendValue
 	copy(v[:], b)
 	return v
+}
+
+//	struct cali_maglev_key {
+//		__u32 svc_id;
+//		__u32 ordinal; // should always be a value of [0..M-1], where M is a very large prime number. -Alex
+//	};
+const MaglevBackendKeySize = 8
+
+type MaglevBackendKey [MaglevBackendKeySize]byte
+
+func NewMaglevBackendKey(svcID uint32, ordinal uint32) MaglevBackendKey {
+	var k MaglevBackendKey
+	binary.LittleEndian.PutUint32(k[0:4], svcID)
+	binary.LittleEndian.PutUint32(k[4:8], ordinal)
+	return k
+}
+
+type MaglevBackendKeyInterface interface {
+	SvcID() uint32
+	Ordinal() uint32
+	AsBytes() []byte
+}
+
+func NewMaglevBackendKeyIntf(svcID, ordinal uint32) MaglevBackendKeyInterface {
+	return NewMaglevBackendKey(svcID, uint32(ordinal))
+}
+
+func (k MaglevBackendKey) SvcID() uint32 {
+	return binary.LittleEndian.Uint32(k[0:4])
+}
+
+func (k MaglevBackendKey) Ordinal() uint32 {
+	return binary.LittleEndian.Uint32(k[4:8])
+}
+
+func (k MaglevBackendKey) AsBytes() []byte {
+	return k[:]
+}
+
+func (k MaglevBackendKey) String() string {
+	svcID := k.SvcID()
+	ord := k.Ordinal()
+	return fmt.Sprintf("MaglevBackendKey{SvcID: %d, Ordinal: %d}", svcID, ord)
+}
+
+func MaglevBackendKeyFromBytes(b []byte) MaglevBackendKeyInterface {
+	var k MaglevBackendKey
+	copy(k[:], b)
+	return k
+}
+
+var _ MaglevBackendKeyInterface = MaglevBackendKey{}
+
+const maglevBackendValueSize = backendValueSize
+
+var MaglevMapParameters = maps.MapParameters{
+	Type:       "hash",
+	KeySize:    MaglevBackendKeySize,
+	ValueSize:  maglevBackendValueSize,
+	MaxEntries: 1009,
+	Name:       "cali_v4_mglv",
+	Flags:      unix.BPF_F_NO_PREALLOC,
+	Version:    2,
+}
+
+func MaglevMap() maps.MapWithExistsCheck {
+	return maps.NewPinnedMap(MaglevMapParameters)
+}
+
+type MaglevMapMem map[MaglevBackendKey]BackendValue
+
+// Equal implements the comparable interface.
+func (m MaglevMapMem) Equal(cmp MaglevMapMem) bool {
+	if len(m) != len(cmp) {
+		return false
+	}
+
+	for k, v := range m {
+		if v2, ok := cmp[k]; !ok || v != v2 {
+			return false
+		}
+	}
+
+	return true
+}
+
+// LoadMaglevMap loads the Maglev NAT map into a go map or returns an error
+func LoadMaglevMap(m maps.Map) (MaglevMapMem, error) {
+	ret := make(MaglevMapMem)
+
+	if err := m.Open(); err != nil {
+		return nil, err
+	}
+
+	iterFn := MaglevMapMemIter(ret)
+
+	err := m.Iter(func(k, v []byte) maps.IteratorAction {
+		iterFn(k, v)
+		return maps.IterNone
+	})
+	if err != nil {
+		ret = nil
+	}
+
+	return ret, err
+}
+
+// MaglevMapMemIter returns maps.MapIter that loads the provided MaglevMapMem
+func MaglevMapMemIter(m MaglevMapMem) func(k, v []byte) {
+	ks := len(MaglevBackendKey{})
+	vs := len(BackendValue{})
+
+	return func(k, v []byte) {
+		var key MaglevBackendKey
+		copy(key[:ks], k[:ks])
+
+		var val BackendValue
+		copy(val[:vs], v[:vs])
+
+		m[key] = val
+	}
 }
 
 var FrontendMapParameters = maps.MapParameters{
@@ -458,7 +644,21 @@ const affinityKeySize = frontendAffKeySize + 8
 // the client's IP
 type AffinityKey [affinityKeySize]byte
 
+type AffinityKeyInterface interface {
+	ClientIP() net.IP
+	FrontendAffinityKey() FrontEndAffinityKeyInterface
+	String() string
+	AsBytes() []byte
+}
+
 type FrontEndAffinityKey [frontendAffKeySize]byte
+
+type FrontEndAffinityKeyInterface interface {
+	Proto() uint8
+	Addr() net.IP
+	Port() uint16
+	AsBytes() []byte
+}
 
 func (k FrontEndAffinityKey) AsBytes() []byte {
 	return k[:]
@@ -500,7 +700,7 @@ func (k AffinityKey) ClientIP() net.IP {
 }
 
 // FrontendKey returns the FrontendKey part of the key
-func (k AffinityKey) FrontendAffinityKey() FrontEndAffinityKey {
+func (k AffinityKey) FrontendAffinityKey() FrontEndAffinityKeyInterface {
 	var f FrontEndAffinityKey
 	copy(f[:], k[:frontendAffKeySize])
 
@@ -516,6 +716,16 @@ func (k AffinityKey) AsBytes() []byte {
 	return k[:]
 }
 
+func AffinityKeyFromBytes(b []byte) AffinityKey {
+	var v AffinityKey
+	copy(v[:], b)
+	return v
+}
+
+func AffinityKeyIntfFromBytes(b []byte) AffinityKeyInterface {
+	return AffinityKeyFromBytes(b)
+}
+
 // struct calico_nat_v4_affinity_val {
 //    struct calico_nat_dest;
 //    uint64_t ts;
@@ -526,6 +736,11 @@ const affinityValueSize = backendValueSize + 8
 // AffinityValue represents a backend picked by the affinity and the timestamp
 // of its creating
 type AffinityValue [affinityValueSize]byte
+
+type AffinityValueInterface interface {
+	Timestamp() time.Duration
+	Backend() BackendValueInterface
+}
 
 // NewAffinityValue creates a value from a timestamp and a backend
 func NewAffinityValue(ts uint64, backend BackendValue) AffinityValue {
@@ -547,7 +762,7 @@ func (v AffinityValue) Timestamp() time.Duration {
 }
 
 // Backend returns the backend the affinity ties the frontend + client to.
-func (v AffinityValue) Backend() BackendValue {
+func (v AffinityValue) Backend() BackendValueInterface {
 	var b BackendValue
 
 	copy(b[:], v[:backendValueSize])
@@ -562,6 +777,16 @@ func (v AffinityValue) String() string {
 // AsBytes returns the value as []byte
 func (v AffinityValue) AsBytes() []byte {
 	return v[:]
+}
+
+func AffinityValueFromBytes(b []byte) AffinityValue {
+	var v AffinityValue
+	copy(v[:], b)
+	return v
+}
+
+func AffinityValueIntfFromBytes(b []byte) AffinityValueInterface {
+	return AffinityValueFromBytes(b)
 }
 
 // AffinityMapParameters describe the AffinityMap

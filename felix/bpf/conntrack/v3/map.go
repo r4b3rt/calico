@@ -23,6 +23,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 
+	v4 "github.com/projectcalico/calico/felix/bpf/conntrack/v4"
 	"github.com/projectcalico/calico/felix/bpf/maps"
 )
 
@@ -36,6 +37,16 @@ const ValueSize = 88
 const MaxEntries = 512000
 
 type Key [KeySize]byte
+
+type KeyInterface interface {
+	Proto() uint8
+	AddrA() net.IP
+	PortA() uint16
+	AddrB() net.IP
+	PortB() uint16
+	String() string
+	AsBytes() []byte
+}
 
 func (k Key) AsBytes() []byte {
 	return k[:]
@@ -67,7 +78,9 @@ func (k Key) String() string {
 }
 
 func (k Key) Upgrade() maps.Upgradable {
-	panic("conntrack map key already at its latest version")
+	var key4 v4.Key
+	copy(key4[:], k[:])
+	return key4
 }
 
 func NewKey(proto uint8, ipA net.IP, portA uint16, ipB net.IP, portB uint16) Key {
@@ -81,7 +94,7 @@ func NewKey(proto uint8, ipA net.IP, portA uint16, ipB net.IP, portB uint16) Key
 }
 
 // struct calico_ct_value {
-//  __u64 created;
+//  __u64 rst_seen;
 //  __u64 last_seen; // 8
 //  __u8 type;     // 16
 //  __u8 flags;     // 17
@@ -115,7 +128,7 @@ func NewKey(proto uint8, ipA net.IP, portA uint16, ipB net.IP, portB uint16) Key
 // };
 
 const (
-	VoCreated   int = 0
+	VoRSTSeen   int = 0
 	VoLastSeen  int = 8
 	VoType      int = 16
 	VoFlags     int = 17
@@ -133,8 +146,25 @@ const (
 
 type Value [ValueSize]byte
 
-func (e Value) Created() int64 {
-	return int64(binary.LittleEndian.Uint64(e[VoCreated : VoCreated+8]))
+type ValueInterface interface {
+	RSTSeen() int64
+	LastSeen() int64
+	Type() uint8
+	Flags() uint16
+	OrigIP() net.IP
+	OrigPort() uint16
+	OrigSPort() uint16
+	NATSPort() uint16
+	OrigSrcIP() net.IP
+	ReverseNATKey() KeyInterface
+	AsBytes() []byte
+	Data() EntryData
+	IsForwardDSR() bool
+	String() string
+}
+
+func (e Value) RSTSeen() int64 {
+	return int64(binary.LittleEndian.Uint64(e[VoRSTSeen : VoRSTSeen+8]))
 }
 
 func (e Value) LastSeen() int64 {
@@ -180,23 +210,24 @@ const (
 	TypeNATForward
 	TypeNATReverse
 
-	FlagNATOut    uint16 = (1 << 0)
-	FlagNATFwdDsr uint16 = (1 << 1)
-	FlagNATNPFwd  uint16 = (1 << 2)
-	FlagSkipFIB   uint16 = (1 << 3)
-	FlagReserved4 uint16 = (1 << 4)
-	FlagReserved5 uint16 = (1 << 5)
-	FlagExtLocal  uint16 = (1 << 6)
-	FlagViaNATIf  uint16 = (1 << 7)
-	FlagSrcDstBA  uint16 = (1 << 8)
-	FlagHostPSNAT uint16 = (1 << 9)
-	FlagSvcSelf   uint16 = (1 << 10)
-	FlagNPLoop    uint16 = (1 << 11)
-	FlagNPRemote  uint16 = (1 << 12)
-	FlagNoDSR     uint16 = (1 << 13)
+	FlagNATOut      uint16 = (1 << 0)
+	FlagNATFwdDsr   uint16 = (1 << 1)
+	FlagNATNPFwd    uint16 = (1 << 2)
+	FlagSkipFIB     uint16 = (1 << 3)
+	FlagReserved4   uint16 = (1 << 4)
+	FlagReserved5   uint16 = (1 << 5)
+	FlagExtLocal    uint16 = (1 << 6)
+	FlagViaNATIf    uint16 = (1 << 7)
+	FlagSrcDstBA    uint16 = (1 << 8)
+	FlagHostPSNAT   uint16 = (1 << 9)
+	FlagSvcSelf     uint16 = (1 << 10)
+	FlagNPLoop      uint16 = (1 << 11)
+	FlagNPRemote    uint16 = (1 << 12)
+	FlagNoDSR       uint16 = (1 << 13)
+	FlagNoRedirPeer uint16 = (1 << 14)
 )
 
-func (e Value) ReverseNATKey() Key {
+func (e Value) ReverseNATKey() KeyInterface {
 	var ret Key
 
 	l := len(Key{})
@@ -226,8 +257,7 @@ func (e *Value) SetNATSport(sport uint16) {
 	binary.LittleEndian.PutUint16(e[VoNATSPort:VoNATSPort+2], sport)
 }
 
-func initValue(v *Value, created, lastSeen time.Duration, typ uint8, flags uint16) {
-	binary.LittleEndian.PutUint64(v[VoCreated:VoCreated+8], uint64(created))
+func initValue(v *Value, lastSeen time.Duration, typ uint8, flags uint16) {
 	binary.LittleEndian.PutUint64(v[VoLastSeen:VoLastSeen+8], uint64(lastSeen))
 	v[VoType] = typ
 	v[VoFlags] = byte(flags & 0xff)
@@ -235,10 +265,10 @@ func initValue(v *Value, created, lastSeen time.Duration, typ uint8, flags uint1
 }
 
 // NewValueNormal creates a new Value of type TypeNormal based on the given parameters
-func NewValueNormal(created, lastSeen time.Duration, flags uint16, legA, legB Leg) Value {
+func NewValueNormal(lastSeen time.Duration, flags uint16, legA, legB Leg) Value {
 	v := Value{}
 
-	initValue(&v, created, lastSeen, TypeNormal, flags)
+	initValue(&v, lastSeen, TypeNormal, flags)
 
 	v.SetLegA2B(legA)
 	v.SetLegB2A(legB)
@@ -248,10 +278,10 @@ func NewValueNormal(created, lastSeen time.Duration, flags uint16, legA, legB Le
 
 // NewValueNATForward creates a new Value of type TypeNATForward for the given
 // arguments and the reverse key
-func NewValueNATForward(created, lastSeen time.Duration, flags uint16, revKey Key) Value {
+func NewValueNATForward(lastSeen time.Duration, flags uint16, revKey Key) Value {
 	v := Value{}
 
-	initValue(&v, created, lastSeen, TypeNATForward, flags)
+	initValue(&v, lastSeen, TypeNATForward, flags)
 
 	copy(v[VoRevKey:VoRevKey+KeySize], revKey.AsBytes())
 
@@ -260,11 +290,11 @@ func NewValueNATForward(created, lastSeen time.Duration, flags uint16, revKey Ke
 
 // NewValueNATReverse creates a new Value of type TypeNATReverse for the given
 // arguments and reverse parameters
-func NewValueNATReverse(created, lastSeen time.Duration, flags uint16, legA, legB Leg,
+func NewValueNATReverse(lastSeen time.Duration, flags uint16, legA, legB Leg,
 	tunnelIP, origIP net.IP, origPort uint16) Value {
 	v := Value{}
 
-	initValue(&v, created, lastSeen, TypeNATReverse, flags)
+	initValue(&v, lastSeen, TypeNATReverse, flags)
 
 	v.SetLegA2B(legA)
 	v.SetLegB2A(legB)
@@ -278,9 +308,9 @@ func NewValueNATReverse(created, lastSeen time.Duration, flags uint16, legA, leg
 }
 
 // NewValueNATReverseSNAT in addition to NewValueNATReverse sets the orig source IP
-func NewValueNATReverseSNAT(created, lastSeen time.Duration, flags uint16, legA, legB Leg,
+func NewValueNATReverseSNAT(lastSeen time.Duration, flags uint16, legA, legB Leg,
 	tunnelIP, origIP, origSrcIP net.IP, origPort uint16) Value {
-	v := NewValueNATReverse(created, lastSeen, flags, legA, legB, tunnelIP, origIP, origPort)
+	v := NewValueNATReverse(lastSeen, flags, legA, legB, tunnelIP, origIP, origPort)
 	copy(v[VoOrigSIP:VoOrigSIP+4], origIP.To4())
 
 	return v
@@ -296,6 +326,7 @@ type Leg struct {
 	RstSeen  bool
 	Approved bool
 	Opener   bool
+	Workload bool
 	Ifindex  uint32
 }
 
@@ -321,10 +352,11 @@ func (leg Leg) AsBytes() []byte {
 	setBit(&bits, 3, leg.RstSeen)
 	setBit(&bits, 4, leg.Approved)
 	setBit(&bits, 5, leg.Opener)
+	setBit(&bits, 6, leg.Workload)
 
 	binary.LittleEndian.PutUint64(bytes[0:8], leg.Bytes)
 	binary.LittleEndian.PutUint32(bytes[8:12], leg.Packets)
-	binary.LittleEndian.PutUint32(bytes[legExtra+0:legExtra+4], leg.Seqno)
+	binary.BigEndian.PutUint32(bytes[legExtra+0:legExtra+4], leg.Seqno)
 	binary.LittleEndian.PutUint32(bytes[legExtra+4:legExtra+8], bits)
 	binary.LittleEndian.PutUint32(bytes[legExtra+8:legExtra+12], leg.Ifindex)
 
@@ -351,6 +383,9 @@ func (leg Leg) Flags() uint32 {
 	if leg.Opener {
 		flags |= 1 << 5
 	}
+	if leg.Workload {
+		flags |= 1 << 6
+	}
 	return flags
 }
 
@@ -370,6 +405,7 @@ func readConntrackLeg(b []byte) Leg {
 		RstSeen:  bitSet(bits, 3),
 		Approved: bitSet(bits, 4),
 		Opener:   bitSet(bits, 5),
+		Workload: bitSet(bits, 6),
 		Ifindex:  binary.LittleEndian.Uint32(b[legExtra+8 : legExtra+12]),
 	}
 }
@@ -472,8 +508,8 @@ func (e Value) String() string {
 		}
 	}
 
-	ret := fmt.Sprintf("Entry{Type:%d, Created:%d, LastSeen:%d, Flags:%s ",
-		e.Type(), e.Created(), e.LastSeen(), flagsStr)
+	ret := fmt.Sprintf("Entry{Type:%d, LastSeen:%d, Flags:%s ",
+		e.Type(), e.LastSeen(), flagsStr)
 
 	switch e.Type() {
 	case TypeNATForward:
@@ -492,7 +528,9 @@ func (e Value) IsForwardDSR() bool {
 }
 
 func (e Value) Upgrade() maps.Upgradable {
-	panic("conntrack map value already at its latest version")
+	var value4 v4.Value
+	copy(value4[:], e[:])
+	return value4
 }
 
 var MapParams = maps.MapParameters{
@@ -506,13 +544,7 @@ var MapParams = maps.MapParameters{
 	UpdatedByBPF: true,
 }
 
-const (
-	ProtoICMP = 1
-	ProtoTCP  = 6
-	ProtoUDP  = 17
-)
-
-func KeyFromBytes(k []byte) Key {
+func KeyFromBytes(k []byte) KeyInterface {
 	var ctKey Key
 	if len(k) != len(ctKey) {
 		log.Panic("Key has unexpected length")
@@ -521,7 +553,7 @@ func KeyFromBytes(k []byte) Key {
 	return ctKey
 }
 
-func ValueFromBytes(v []byte) Value {
+func ValueFromBytes(v []byte) ValueInterface {
 	var ctVal Value
 	if len(v) != len(ctVal) {
 		log.Panic("Value has unexpected length")

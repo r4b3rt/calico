@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -19,13 +19,18 @@ limitations under the License.
 package server
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	gpath "path"
 
+	"github.com/sirupsen/logrus"
+	"k8s.io/apiserver/pkg/admission/plugin/policy/mutating"
+	"k8s.io/apiserver/pkg/admission/plugin/policy/validating"
 	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/options"
 	"k8s.io/klog/v2"
 
 	"github.com/projectcalico/calico/apiserver/pkg/apiserver"
@@ -39,68 +44,86 @@ func PrepareServer(opts *CalicoServerOptions) (*apiserver.ProjectCalicoServer, e
 		opts.StopCh = make(chan struct{})
 	}
 
+	// MAP plugin hard-coded disable — enabling here would break on k8s < 1.36
+	// (v1.MutatingAdmissionPolicy doesn't exist on the cluster). As a result,
+	// user-defined MAPs against projectcalico.org/v3 won't fire here. To use
+	// MAP, Calico should be installed without calico-apiserver, where
+	// kube-apiserver serves v3 as CRDs and enforces MAPs directly.
+	disabledPlugins := []string{mutating.PluginName}
+	klog.Infof("Enabling ValidatingAdmissionPolicy: %v", opts.EnableValidatingAdmissionPolicy)
+	if !opts.EnableValidatingAdmissionPolicy {
+		disabledPlugins = append(disabledPlugins, validating.PluginName)
+	}
+	if opts.RecommendedOptions.Admission == nil {
+		opts.RecommendedOptions.Admission = options.NewAdmissionOptions()
+	}
+	opts.RecommendedOptions.Admission.DisablePlugins = append(
+		opts.RecommendedOptions.Admission.DisablePlugins, disabledPlugins...,
+	)
+
 	config, err := opts.Config()
 	if err != nil {
 		return nil, err
 	}
 
-	klog.V(4).Infoln("Completing API server configuration")
+	logrus.Debug("Completing API server configuration")
 	return config.Complete().New()
 }
 
 // RunServer runs the Calico API server.  This blocks until stopped channel (passed in through options) is closed.
 func RunServer(opts *CalicoServerOptions, server *apiserver.ProjectCalicoServer) error {
-	readinessPath := "/tmp/ready"
-	_ = os.Remove(readinessPath)
-
-	allStop := make(chan struct{})
+	// Create a context rather than using the stop channel - it's a little more versatile.
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		klog.Infoln("Starting watch extension")
-		changed, err := WatchExtensionAuth(allStop)
-		if err != nil {
-			klog.Errorln("Unable to watch the extension auth ConfigMap: ", err)
-		}
-		if changed {
-			klog.Infoln("Detected change in extension-apiserver-authentication ConfigMap, exiting so apiserver can be restarted")
+		// Wait for the stop channel and cancel.
+		select {
+		case <-opts.StopCh:
+			cancel()
+		case <-ctx.Done():
 		}
 	}()
 
 	go func() {
-		klog.Infoln("Running the API server")
+		logrus.Info("Starting watch extension")
+		changed, err := WatchExtensionAuth(ctx)
+		if err != nil {
+			logrus.Error("Unable to watch the extension auth ConfigMap: ", err)
+		}
+		if changed {
+			logrus.Info("Detected change in extension-apiserver-authentication ConfigMap, exiting so apiserver can be restarted")
+			cancel()
+		}
+	}()
 
-		// Add a post-start hook to write the readiness file, which is used for
-		// readiness probes.
-		server.GenericAPIServer.AddPostStartHook("apiserver-autoregistration",
-			func(context genericapiserver.PostStartHookContext) error {
-				f, err := os.Create(readinessPath)
-				if err != nil {
-					klog.Errorln(err)
-					return err
-				}
-				klog.Info("apiserver is ready.")
-				f.Close()
-				return nil
-			})
+	go func() {
+		logrus.Info("Running the API server")
+
+		// Start the Calico resource handler and shared informers and wait for sync before starting other components.
+		server.CalicoResourceLister.Start()
+		server.WatchManager.Start()
+		server.SharedInformerFactory.Start(ctx.Done())
+		server.CalicoResourceLister.WaitForCacheSync(ctx.Done())
+		server.WatchManager.WaitForCacheSync(ctx.Done())
+		server.SharedInformerFactory.WaitForCacheSync(ctx.Done())
 
 		if opts.PrintSwagger {
-			server.GenericAPIServer.AddPostStartHook("swagger-printer",
+			if err := server.GenericAPIServer.AddPostStartHook("swagger-printer",
 				func(context genericapiserver.PostStartHookContext) error {
 					WriteSwaggerJSON(server.GenericAPIServer.Handler, opts.SwaggerFilePath)
 					// PrintSwagger option prints and exit.
 					os.Exit(0)
 					return nil
-				})
+				}); err != nil {
+				logrus.Error("failed to add post start hook swagger-printer:", err)
+			}
 		}
-		if err := server.GenericAPIServer.PrepareRun().Run(allStop); err != nil {
-			klog.Errorln("Error running API server: ", err)
+		if err := server.GenericAPIServer.PrepareRun().RunWithContext(ctx); err != nil {
+			logrus.Error("Error running API server: ", err)
 		}
 	}()
 
-	select {
-	case <-allStop:
-	case <-opts.StopCh:
-		close(allStop)
-	}
+	// Wait until the context is done.
+	<-ctx.Done()
 
 	return nil
 }
@@ -115,7 +138,7 @@ func WriteSwaggerJSON(handler *genericapiserver.APIServerHandler, path string) {
 	if err != nil {
 		panic(fmt.Sprintf("Could not create file at '%s'. Reason: %v", swaggerPath, err))
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	resp := &fileResponseWriter{f}
 	handler.ServeHTTP(resp, req)
 }

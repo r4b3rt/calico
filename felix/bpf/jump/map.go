@@ -21,21 +21,44 @@ import (
 )
 
 const (
-	MaxEntries    = 10000
-	XDPMaxEntries = 100
+	// MaxSubPrograms is the maximum number of policy sub-programs that
+	// we allow for a single hook.  BPF allows a maximum of 32 tail calls
+	// (so 33 chained programs in total) but we reserve some for our own use.
+	MaxSubPrograms = 24
+
+	// TCMaxEntryPoints is the maximum number of policy program entry points
+	// (i.e. first program in a chain of sub-programs for the policy).
+	TCMaxEntryPoints = 10000
+	// TCMaxEntries is the size fo the map, i.e. all possible sub-programs.
+	TCMaxEntries = TCMaxEntryPoints * MaxSubPrograms
+
+	XDPMaxEntryPoints = 100
+	XDPMaxEntries     = XDPMaxEntryPoints * MaxSubPrograms
 )
 
-var MapParameters = maps.MapParameters{
+var IngressMapParameters = maps.MapParameters{
 	Type:       "prog_array",
 	KeySize:    4,
 	ValueSize:  4,
-	MaxEntries: MaxEntries,
-	Name:       "cali_jump",
+	MaxEntries: TCMaxEntries,
+	Name:       "cali_jump_ing",
 	Version:    2,
 }
 
-func Map() maps.Map {
-	return maps.NewPinnedMap(MapParameters)
+var EgressMapParameters = maps.MapParameters{
+	Type:       "prog_array",
+	KeySize:    4,
+	ValueSize:  4,
+	MaxEntries: TCMaxEntries,
+	Name:       "cali_jump_egr",
+	Version:    2,
+}
+
+func Maps() []maps.Map {
+	return []maps.Map{
+		maps.NewPinnedMap(IngressMapParameters),
+		maps.NewPinnedMap(EgressMapParameters),
+	}
 }
 
 var XDPMapParameters = maps.MapParameters{
@@ -44,11 +67,40 @@ var XDPMapParameters = maps.MapParameters{
 	ValueSize:  4,
 	MaxEntries: XDPMaxEntries,
 	Name:       "xdp_cali_jump",
-	Version:    2,
+	Version:    3,
 }
 
 func XDPMap() maps.Map {
 	return maps.NewPinnedMap(XDPMapParameters)
+}
+
+// Netkit maps are identical to TC maps but pinned to a separate directory
+// so that netkit-attached programs (which have a different expected_attach_type)
+// get their own prog_array instances. The kernel requires all programs in a
+// prog_array to share the same expected_attach_type.
+var NetkitIngressMapParameters = maps.MapParameters{
+	Type:       "prog_array",
+	KeySize:    4,
+	ValueSize:  4,
+	MaxEntries: TCMaxEntries,
+	Name:       "cali_j_nk_ing",
+	Version:    2,
+}
+
+var NetkitEgressMapParameters = maps.MapParameters{
+	Type:       "prog_array",
+	KeySize:    4,
+	ValueSize:  4,
+	MaxEntries: TCMaxEntries,
+	Name:       "cali_j_nk_egr",
+	Version:    2,
+}
+
+func NetkitMaps() []maps.Map {
+	return []maps.Map{
+		maps.NewPinnedMap(NetkitIngressMapParameters),
+		maps.NewPinnedMap(NetkitEgressMapParameters),
+	}
 }
 
 func Key(idx int) []byte {

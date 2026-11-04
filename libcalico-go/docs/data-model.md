@@ -24,7 +24,6 @@ The following illustrates the directory structure calico uses in etcd.
        |  |     |--config       # Host level config
        |  |     |  |--...
        |  |     |  `--marker 
-       |  |     |--bird_ip      # the host IP (IPv4) [to be retired]
        |  |     |--workload
        |  |     |  `--<orchestrator-id>  # E.g. docker, openstack, k8s
        |  |     |     `--<container-id>  # one for each container on the Docker Host
@@ -252,7 +251,7 @@ If `labels` is missing, it is treated as if there was an empty dict.
 
 ### Host endpoints
 
-For host enpdoints, the object stored is a JSON blob of the following
+For host endpoints, the object stored is a JSON blob of the following
 form; the fields are described below:
 
 ```
@@ -556,7 +555,7 @@ which Calico uses to enforce the rule.
 
 > **WARNING**
 >
-> Due to the same kernel limiation, the negated versions of the
+> Due to the same kernel limitation, the negated versions of the
 > ICMP matches are treated together as a single match. A rule
 > that uses `!icmp_type` and `!icmp_code` together will match
 > all ICMP traffic apart from traffic that matches **both** type

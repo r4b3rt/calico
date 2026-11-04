@@ -17,12 +17,10 @@ package clientv3_test
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
@@ -34,7 +32,6 @@ import (
 )
 
 var _ = testutils.E2eDatastoreDescribe("ClusterInformation tests", testutils.DatastoreAll, func(config apiconfig.CalicoAPIConfig) {
-
 	ctx := context.Background()
 	name := "default"
 	readyTrue := true
@@ -218,7 +215,7 @@ var _ = testutils.E2eDatastoreDescribe("ClusterInformation tests", testutils.Dat
 		func(name string, spec1, spec2 apiv3.ClusterInformationSpec) {
 			By("Updating the ClusterInformation before it is created")
 			_, outError := c.ClusterInformation().Update(ctx, &apiv3.ClusterInformation{
-				ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: "test-fail-clusterinfo"},
+				ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "1234", CreationTimestamp: metav1.Now(), UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -262,7 +259,7 @@ var _ = testutils.E2eDatastoreDescribe("ClusterInformation tests", testutils.Dat
 				Spec:       spec2,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
-			Expect(outError.Error()).To(Equal("resource already exists: ClusterInformation(" + name + ")"))
+			Expect(outError.Error()).To(ContainSubstring("resource already exists: ClusterInformation(" + name + ") with error:"))
 
 			By("Getting ClusterInformation (name) and comparing the output against spec1")
 			res, outError := c.ClusterInformation().Get(ctx, name, options.GetOptions{})
@@ -285,7 +282,7 @@ var _ = testutils.E2eDatastoreDescribe("ClusterInformation tests", testutils.Dat
 
 			By("Attempting to update the ClusterInformation without a Creation Timestamp")
 			res, outError = c.ClusterInformation().Update(ctx, &apiv3.ClusterInformation{
-				ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "1234", UID: "test-fail-clusterinfo"},
+				ObjectMeta: metav1.ObjectMeta{Name: name, ResourceVersion: "1234", UID: uid},
 				Spec:       spec1,
 			}, options.SetOptions{})
 			Expect(outError).To(HaveOccurred())
@@ -364,7 +361,6 @@ var _ = testutils.E2eDatastoreDescribe("ClusterInformation tests", testutils.Dat
 			outList, outError = c.ClusterInformation().List(ctx, options.ListOptions{})
 			Expect(outError).NotTo(HaveOccurred())
 			Expect(outList.Items).To(HaveLen(0))
-
 		},
 
 		// Test 1: Pass two fully populated ClusterInformationSpecs and expect the series of operations to succeed.
@@ -499,7 +495,7 @@ var _ = testutils.E2eDatastoreDescribe("ClusterInformation tests", testutils.Dat
 
 			By("Cleaning the datastore and expecting deletion events for each configured resource (tests prefix deletes results in individual events for each key)")
 			be.Clean()
-			testWatcher3.ExpectEvents(apiv3.KindClusterInformation, []watch.Event{
+			testWatcher3.ExpectEventsAnyOrder(apiv3.KindClusterInformation, []watch.Event{
 				{
 					Type:     watch.Deleted,
 					Previous: outRes3,

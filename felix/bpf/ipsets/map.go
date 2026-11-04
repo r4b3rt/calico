@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Copyright (c) 2020 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,12 +18,12 @@ package ipsets
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
-
 	"golang.org/x/sys/unix"
 
 	"github.com/projectcalico/calico/felix/bpf/maps"
@@ -51,6 +53,7 @@ var MapParameters = maps.MapParameters{
 
 func init() {
 	SetMapSize(MapParameters.MaxEntries)
+	SetMapSize(MapV6Parameters.MaxEntries)
 }
 
 func SetMapSize(size int) {
@@ -59,6 +62,19 @@ func SetMapSize(size int) {
 
 func Map() maps.Map {
 	return maps.NewPinnedMap(MapParameters)
+}
+
+type IPSetEntryInterface interface {
+	SetID() uint64
+	Addr() net.IP
+	PrefixLen() uint32
+	Protocol() uint8
+	Port() uint16
+	AsBytes() []byte
+}
+
+func (e IPSetEntry) AsBytes() []byte {
+	return e[:]
 }
 
 func (e IPSetEntry) SetID() uint64 {
@@ -81,7 +97,17 @@ func (e IPSetEntry) Port() uint16 {
 	return binary.LittleEndian.Uint16(e[16:18])
 }
 
-func MakeBPFIPSetEntry(setID uint64, cidr ip.V4CIDR, port uint16, proto uint8) *IPSetEntry {
+func (e IPSetEntry) String() string {
+	return fmt.Sprintf("0x%08x %11s prefix %d port %d  proto %d", e.SetID(), e.Addr(), e.PrefixLen(), e.Port(), e.Protocol())
+}
+
+func IPSetEntryFromBytes(b []byte) IPSetEntryInterface {
+	var e IPSetEntry
+	copy(e[:], b)
+	return e
+}
+
+func MakeBPFIPSetEntry(setID uint64, cidr ip.V4CIDR, port uint16, proto uint8) IPSetEntryInterface {
 	var entry IPSetEntry
 	// TODO Detect endianness
 	if proto == 0 {
@@ -95,12 +121,12 @@ func MakeBPFIPSetEntry(setID uint64, cidr ip.V4CIDR, port uint16, proto uint8) *
 	binary.BigEndian.PutUint32(entry[12:16], cidr.Addr().(ip.V4Addr).AsUint32())
 	binary.LittleEndian.PutUint16(entry[16:18], port)
 	entry[18] = proto
-	return &entry
+	return entry
 }
 
 var DummyValue = []byte{1, 0, 0, 0}
 
-func ProtoIPSetMemberToBPFEntry(id uint64, member string) *IPSetEntry {
+func ProtoIPSetMemberToBPFEntry(id uint64, member string) IPSetEntryInterface {
 	var cidrStr string
 	var port uint16
 	var protocol uint8
@@ -132,4 +158,27 @@ func ProtoIPSetMemberToBPFEntry(id uint64, member string) *IPSetEntry {
 	}
 	entry := MakeBPFIPSetEntry(id, cidr, port, protocol)
 	return entry
+}
+
+type MapMem map[IPSetEntry]struct{}
+
+func MapMemIter(m MapMem) func(k, v []byte) {
+	ks := len(IPSetEntry{})
+
+	return func(k, v []byte) {
+		var key IPSetEntry
+		copy(key[:ks], k[:ks])
+
+		m[key] = struct{}{}
+	}
+}
+
+func (m MapMem) String() string {
+	var out strings.Builder
+
+	for k := range m {
+		out.WriteString(k.String() + "\n")
+	}
+
+	return out.String()
 }

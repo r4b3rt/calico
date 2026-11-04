@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,19 @@
 package calc
 
 import (
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
-
-	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
 	"github.com/projectcalico/calico/felix/config"
 	"github.com/projectcalico/calico/felix/dispatcher"
 	"github.com/projectcalico/calico/felix/labelindex"
+	"github.com/projectcalico/calico/felix/labelindex/ipsetmember"
 	"github.com/projectcalico/calico/felix/proto"
 	"github.com/projectcalico/calico/felix/serviceindex"
+	"github.com/projectcalico/calico/felix/types"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
-	"github.com/projectcalico/calico/libcalico-go/lib/net"
 )
 
 var gaugeNumActiveSelectors = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -41,8 +41,8 @@ func init() {
 
 type ipSetUpdateCallbacks interface {
 	OnIPSetAdded(setID string, ipSetType proto.IPSetUpdate_IPSetType)
-	OnIPSetMemberAdded(setID string, ip labelindex.IPSetMember)
-	OnIPSetMemberRemoved(setID string, ip labelindex.IPSetMember)
+	OnIPSetMemberAdded(setID string, ip ipsetmember.IPSetMember)
+	OnIPSetMemberRemoved(setID string, ip ipsetmember.IPSetMember)
 	OnIPSetRemoved(setID string)
 }
 
@@ -54,13 +54,15 @@ type rulesUpdateCallbacks interface {
 }
 
 type endpointCallbacks interface {
-	OnEndpointTierUpdate(endpointKey model.Key,
-		endpoint interface{},
+	OnEndpointTierUpdate(endpointKey model.EndpointKey,
+		endpoint model.Endpoint,
+		computedData []EndpointComputedData,
+		peerData *EndpointBGPPeer,
 		filteredTiers []TierInfo)
 }
 
 type configCallbacks interface {
-	OnConfigUpdate(globalConfig, hostConfig map[string]string)
+	OnConfigUpdate(globalConfig, selectorConfig, hostConfig map[string]string)
 	OnDatastoreNotReady()
 }
 
@@ -69,18 +71,14 @@ type encapCallbacks interface {
 }
 
 type passthruCallbacks interface {
-	OnHostIPUpdate(hostname string, ip *net.IP)
-	OnHostIPRemove(hostname string)
-	OnHostIPv6Update(hostname string, ip *net.IP)
-	OnHostIPv6Remove(hostname string)
-	OnHostMetadataUpdate(hostname string, ip4 *net.IPNet, ip6 *net.IPNet, asnumber string, labels map[string]string)
+	OnHostMetadataUpdate(hostname string, info *HostInfo)
 	OnHostMetadataRemove(hostname string)
 	OnIPPoolUpdate(model.IPPoolKey, *model.IPPool)
 	OnIPPoolRemove(model.IPPoolKey)
 	OnServiceAccountUpdate(*proto.ServiceAccountUpdate)
-	OnServiceAccountRemove(proto.ServiceAccountID)
+	OnServiceAccountRemove(types.ServiceAccountID)
 	OnNamespaceUpdate(*proto.NamespaceUpdate)
-	OnNamespaceRemove(proto.NamespaceID)
+	OnNamespaceRemove(types.NamespaceID)
 	OnWireguardUpdate(string, *model.Wireguard)
 	OnWireguardRemove(string)
 	OnGlobalBGPConfigUpdate(*v3.BGPConfiguration)
@@ -111,13 +109,49 @@ type PipelineCallbacks interface {
 
 type CalcGraph struct {
 	// AllUpdDispatcher is the input node to the calculation graph.
-	AllUpdDispatcher      *dispatcher.Dispatcher
-	activeRulesCalculator *ActiveRulesCalculator
+	AllUpdDispatcher *dispatcher.Dispatcher
+
+	// Pointers to the other calc graph nodes; we don't use most of
+	// these (because the nodes reference each other directly) but
+	// they're very useful when inspecting the state of the calc graph
+	// in the debugger.
+
+	localEndpointDispatcher *dispatcher.Dispatcher
+	activeRulesCalculator   *ActiveRulesCalculator
+	ruleScanner             *RuleScanner
+	serviceIndex            *serviceindex.ServiceIndex
+	ipsetMemberIndex        *labelindex.SelectorAndNamedPortIndex
+	hostIPPassthru          *DataplanePassthru
+	l3RouteResolver         *L3RouteResolver
+	vxlanResolver           *VXLANResolver
+	configBatcher           *ConfigBatcher
+	profileDecoder          *ProfileDecoder
+	encapsulationResolver   *EncapsulationResolver
+	policyResolver          *PolicyResolver
+	liveMigrationCalculator *LiveMigrationCalculator
 }
 
-func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveCallback func()) *CalcGraph {
+func (g *CalcGraph) OnUpdates(updates []api.Update) {
+	g.AllUpdDispatcher.OnUpdates(updates)
+}
+
+func (g *CalcGraph) OnStatusUpdated(update api.SyncStatus) {
+	g.AllUpdDispatcher.OnStatusUpdated(update)
+}
+
+func (g *CalcGraph) Flush() {
+	g.policyResolver.Flush()
+}
+
+func NewCalculationGraph(
+	callbacks PipelineCallbacks,
+	cache *LookupsCache,
+	conf *config.Config,
+	liveCallback func(),
+) *CalcGraph {
 	hostname := conf.FelixHostname
 	log.Infof("Creating calculation graph, filtered to hostname %v", hostname)
+	cg := &CalcGraph{}
 
 	// The source of the processing graph, this dispatcher will be fed all the updates from the
 	// datastore, fanning them out to the registered receivers.
@@ -133,6 +167,7 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	//     receiver_1  ...  receiver_n
 	//
 	allUpdDispatcher := dispatcher.NewDispatcher()
+	cg.AllUpdDispatcher = allUpdDispatcher
 
 	// Some of the receivers only need to know about local endpoints. Create a second dispatcher
 	// that will filter out non-local endpoints.
@@ -153,6 +188,7 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	(*localEndpointDispatcherReg)(localEndpointDispatcher).RegisterWith(allUpdDispatcher)
 	localEndpointFilter := &endpointHostnameFilter{hostname: hostname}
 	localEndpointFilter.RegisterWith(localEndpointDispatcher)
+	cg.localEndpointDispatcher = localEndpointDispatcher
 
 	// The active rules calculator matches local endpoints against policies and profiles to figure
 	// out which policies/profiles are active on this host.  Limiting to policies that apply to
@@ -160,21 +196,40 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	// render into the dataplane.
 	//
 	//           ...
-	//        Dispatcher (all updates)
-	//           /   \
-	//          /     \  All Host/Workload Endpoints
-	//         /       \
-	//        /      Dispatcher (local updates)
-	//       /            |
-	//       | Policies   | Local Host/Workload Endpoints only
-	//       | Profiles   |
-	//       |            |
-	//     Active Rules Calculator
-	//              |
-	//              | Locally active policies/profiles
+	//           Dispatcher (all updates)
+	//                /\        \
+	//               /  \        \  All Host/Workload Endpoints
+	//              /    \        \
+	//             /      \     Dispatcher (local updates)
+	//            /        \             |
+	//            |         \             \  Local Host/Workload
+	//            |          \             \ Endpoints only
+	//           / \          \             \
+	// Profiles /   \ Policies \             \
+	//         /     \          \             \
+	//         \      \          |             \
+	//          \      \         |Tiers        |
+	//           \      \        |             /
+	//            \      |       |            /
+	//             \     |       |           /
+	//              \    |       |          /
+	//              Active Rules Calculator
+	//                   |
+	//                   | Locally active policies/profiles
 	//             ...
 	//
 	activeRulesCalc := NewActiveRulesCalculator()
+	cg.activeRulesCalculator = activeRulesCalc
+
+	// Create and register the live migration calculator on localEndpointDispatcher BEFORE
+	// the active rules calculator.  This ensures the LMC sees WEP updates first, so its
+	// wepData is already populated when the ARC fires computed selector match callbacks.
+	cg.liveMigrationCalculator = NewLiveMigrationCalculator(cg.activeRulesCalculator)
+	localEndpointDispatcher.Register(
+		model.WorkloadEndpointKey{},
+		cg.liveMigrationCalculator.OnUpdate,
+	)
+
 	activeRulesCalc.RegisterWith(localEndpointDispatcher, allUpdDispatcher)
 
 	// The active rules calculator only figures out which rules are active, it doesn't extract
@@ -203,11 +258,12 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	// Send IP set added/removed events to the dataplane.  We'll hook up the other outputs
 	// below.
 	ruleScanner.RulesUpdateCallbacks = callbacks
+	cg.ruleScanner = ruleScanner
 
 	serviceIndex := serviceindex.NewServiceIndex()
 	serviceIndex.RegisterWith(allUpdDispatcher)
 	// Send the Service IP set member index's outputs to the dataplane.
-	serviceIndex.OnMemberAdded = func(ipSetID string, member labelindex.IPSetMember) {
+	serviceIndex.OnMemberAdded = func(ipSetID string, member ipsetmember.IPSetMember) {
 		if log.GetLevel() >= log.DebugLevel {
 			log.WithFields(log.Fields{
 				"ipSetID": ipSetID,
@@ -216,7 +272,7 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 		}
 		callbacks.OnIPSetMemberAdded(ipSetID, member)
 	}
-	serviceIndex.OnMemberRemoved = func(ipSetID string, member labelindex.IPSetMember) {
+	serviceIndex.OnMemberRemoved = func(ipSetID string, member ipsetmember.IPSetMember) {
 		if log.GetLevel() >= log.DebugLevel {
 			log.WithFields(log.Fields{
 				"ipSetID": ipSetID,
@@ -226,6 +282,7 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 		callbacks.OnIPSetMemberRemoved(ipSetID, member)
 	}
 	serviceIndex.OnAlive = liveCallback
+	cg.serviceIndex = serviceIndex
 
 	// The rule scanner only goes as far as figuring out which selectors/named ports are
 	// active. Next we need to figure out which endpoints (and hence which IP addresses/ports) are
@@ -252,7 +309,7 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	//                   |
 	//               <dataplane>
 	//
-	ipsetMemberIndex := labelindex.NewSelectorAndNamedPortIndex()
+	ipsetMemberIndex := labelindex.NewSelectorAndNamedPortIndex(conf.NFTablesMode != "Disabled")
 	ipsetMemberIndex.OnAlive = liveCallback
 	// Wire up the inputs to the IP set member index.
 	ipsetMemberIndex.RegisterWith(allUpdDispatcher)
@@ -276,8 +333,9 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 		callbacks.OnIPSetRemoved(ipSet.UniqueID())
 		gaugeNumActiveSelectors.Dec()
 	}
+
 	// Send the IP set member index's outputs to the dataplane.
-	ipsetMemberIndex.OnMemberAdded = func(ipSetID string, member labelindex.IPSetMember) {
+	ipsetMemberIndex.OnMemberAdded = func(ipSetID string, member ipsetmember.IPSetMember) {
 		if log.GetLevel() >= log.DebugLevel {
 			log.WithFields(log.Fields{
 				"ipSetID": ipSetID,
@@ -286,7 +344,7 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 		}
 		callbacks.OnIPSetMemberAdded(ipSetID, member)
 	}
-	ipsetMemberIndex.OnMemberRemoved = func(ipSetID string, member labelindex.IPSetMember) {
+	ipsetMemberIndex.OnMemberRemoved = func(ipSetID string, member ipsetmember.IPSetMember) {
 		if log.GetLevel() >= log.DebugLevel {
 			log.WithFields(log.Fields{
 				"ipSetID": ipSetID,
@@ -295,6 +353,7 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 		}
 		callbacks.OnIPSetMemberRemoved(ipSetID, member)
 	}
+	cg.ipsetMemberIndex = ipsetMemberIndex
 
 	// The endpoint policy resolver marries up the active policies with local endpoints and
 	// calculates the complete, ordered set of policies that apply to each endpoint.
@@ -319,10 +378,29 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	//
 	polResolver := NewPolicyResolver()
 	// Hook up the inputs to the policy resolver.
-	activeRulesCalc.PolicyMatchListener = polResolver
+	activeRulesCalc.RegisterPolicyMatchListener(polResolver)
 	polResolver.RegisterWith(allUpdDispatcher, localEndpointDispatcher)
 	// And hook its output to the callbacks.
-	polResolver.Callbacks = callbacks
+	polResolver.RegisterCallback(callbacks)
+	cg.policyResolver = polResolver
+
+	// Wire up the live migration calculator's output callback and remaining dispatcher
+	// registration, now that polResolver exists.  (The LMC was created and registered on
+	// localEndpointDispatcher earlier, before the ARC, to ensure correct dispatch ordering.)
+	cg.liveMigrationCalculator.OnEndpointComputedData = polResolver.OnEndpointComputedDataUpdate
+	allUpdDispatcher.Register(
+		model.ResourceKey{},
+		cg.liveMigrationCalculator.OnUpdate,
+	)
+
+	if conf.IsIstioAmbientModeEnabled() {
+		_ = NewIstioCalculator(activeRulesCalc, ruleScanner, callbacks, ipsetMemberIndex, polResolver.OnEndpointComputedDataUpdate)
+	}
+
+	// Create and hook up the active BGP peer calculator.
+	activeBGPPeerCalc := NewActiveBGPPeerCalculator(hostname)
+	activeBGPPeerCalc.RegisterWith(localEndpointDispatcher, allUpdDispatcher)
+	activeBGPPeerCalc.OnEndpointBGPPeerDataUpdate = polResolver.OnEndpointBGPPeerDataUpdate
 
 	// Register for host IP updates.
 	//
@@ -339,8 +417,14 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	//
 	hostIPPassthru := NewDataplanePassthru(callbacks)
 	hostIPPassthru.RegisterWith(allUpdDispatcher)
+	cg.hostIPPassthru = hostIPPassthru
 
-	if conf.BPFEnabled || conf.Encapsulation.VXLANEnabled || conf.Encapsulation.VXLANEnabledV6 || conf.WireguardEnabled || conf.WireguardEnabledV6 {
+	// Encapsulation.NoEncapNeeded already accounts for ProgramClusterRoutes, but
+	// Encapsulation.IPIPEnabled does not, so gate that one explicitly: if BIRD programs the IPIP
+	// cluster routes then Felix has no use for the L3 route resolver on their account.
+	if conf.BPFEnabled || conf.Encapsulation.VXLANEnabled || conf.Encapsulation.VXLANEnabledV6 ||
+		conf.WireguardEnabled || conf.WireguardEnabledV6 || conf.Encapsulation.NoEncapNeeded ||
+		(conf.Encapsulation.IPIPEnabled && conf.ProgramIPIPClusterRoutes()) {
 		// Calculate simple node-ownership routes.
 		//        ...
 		//     Dispatcher (all updates)
@@ -353,9 +437,10 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 		//         |
 		//      <dataplane>
 		//
-		l3RR := NewL3RouteResolver(hostname, callbacks, conf.UseNodeResourceUpdates(), conf.RouteSource)
+		l3RR := NewL3RouteResolver(hostname, callbacks, conf.RouteSource)
 		l3RR.RegisterWith(allUpdDispatcher, localEndpointDispatcher)
 		l3RR.OnAlive = liveCallback
+		cg.l3RouteResolver = l3RR
 	}
 
 	// Calculate VXLAN routes.
@@ -371,8 +456,9 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	//      <dataplane>
 	//
 	if conf.Encapsulation.VXLANEnabled || conf.Encapsulation.VXLANEnabledV6 {
-		vxlanResolver := NewVXLANResolver(hostname, callbacks, conf.UseNodeResourceUpdates())
+		vxlanResolver := NewVXLANResolver(hostname, callbacks)
 		vxlanResolver.RegisterWith(allUpdDispatcher)
+		cg.vxlanResolver = vxlanResolver
 	}
 
 	// Register for config updates.
@@ -390,6 +476,7 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	//
 	configBatcher := NewConfigBatcher(hostname, callbacks)
 	configBatcher.RegisterWith(allUpdDispatcher)
+	cg.configBatcher = configBatcher
 
 	// The profile decoder identifies objects with special dataplane significance which have
 	// been encoded as profiles by libcalico-go. At present this includes Kubernetes Service
@@ -407,6 +494,48 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	//
 	profileDecoder := NewProfileDecoder(callbacks)
 	profileDecoder.RegisterWith(allUpdDispatcher)
+	cg.profileDecoder = profileDecoder
+
+	// The remote endpoint reverse lookup receiver only need to know about non-local endpoints.
+	// Create another dispatcher that will filter out non-local endpoints.
+	//
+	//          ...
+	//       Dispatcher (all updates)
+	//         / ...
+	//        / All Host/Workload Endpoints
+	//       /
+	//   Dispatcher (remote updates)
+	//     <filter>
+	remoteEndpointDispatcher := dispatcher.NewDispatcher()
+	(*remoteEndpointDispatcherReg)(remoteEndpointDispatcher).RegisterWith(allUpdDispatcher)
+	remoteEndpointFilter := &remoteEndpointFilter{hostname: hostname}
+	remoteEndpointFilter.RegisterWith(remoteEndpointDispatcher)
+
+	if cache != nil {
+		// The lookup cache, caches endpoint (and node), networksets, policy and service information.
+		//        ...
+		//     Dispatcher (remote updates)
+		//         |
+		//         | Workload and host endpoints
+		//         |
+		//       lookup cache
+		//
+		cache.epCache.RegisterWith(allUpdDispatcher, remoteEndpointDispatcher)
+		cache.svcCache.RegisterWith(allUpdDispatcher)
+
+		// The lookup cache, caches policy information for prefix lookups. Hook into the
+		// ActiveRulesCalculator to receive local active policy/profile information.
+		activeRulesCalc.PolicyLookupCache = cache.polCache
+
+		// The lookup cache, also provides local endpoint lookups and corresponding tier information.
+		// Hook into the PolicyResolver to receive this information.
+		polResolver.RegisterCallback(cache.epCache)
+
+		// The lookup cache also caches networkset information for flow log reporting.
+		cache.nsCache.RegisterWith(allUpdDispatcher)
+	} else {
+		log.Debug("lookup cache is disabled")
+	}
 
 	// Register for IP Pool updates. EncapsulationResolver will send a message to the
 	// dataplane so that Felix is restarted if IPIP and/or VXLAN encapsulation changes
@@ -421,11 +550,9 @@ func NewCalculationGraph(callbacks PipelineCallbacks, conf *config.Config, liveC
 	//
 	encapsulationResolver := NewEncapsulationResolver(conf, callbacks)
 	encapsulationResolver.RegisterWith(allUpdDispatcher)
+	cg.encapsulationResolver = encapsulationResolver
 
-	return &CalcGraph{
-		AllUpdDispatcher:      allUpdDispatcher,
-		activeRulesCalculator: activeRulesCalc,
-	}
+	return cg
 }
 
 type localEndpointDispatcherReg dispatcher.Dispatcher
@@ -467,5 +594,41 @@ func (f *endpointHostnameFilter) OnUpdate(update api.Update) (filterOut bool) {
 			log.WithField("id", update.Key).Info("Local endpoint updated")
 		}
 	}
+	return
+}
+
+type remoteEndpointDispatcherReg dispatcher.Dispatcher
+
+func (l *remoteEndpointDispatcherReg) RegisterWith(disp *dispatcher.Dispatcher) {
+	red := (*dispatcher.Dispatcher)(l)
+	disp.Register(model.WorkloadEndpointKey{}, red.OnUpdate)
+	disp.Register(model.HostEndpointKey{}, red.OnUpdate)
+	disp.RegisterStatusHandler(red.OnDatamodelStatus)
+}
+
+// remoteEndpointFilter provides an UpdateHandler that filters out endpoints
+// that are on the given host.
+type remoteEndpointFilter struct {
+	hostname string
+}
+
+func (f *remoteEndpointFilter) RegisterWith(remoteEndpointDisp *dispatcher.Dispatcher) {
+	remoteEndpointDisp.Register(model.WorkloadEndpointKey{}, f.OnUpdate)
+	remoteEndpointDisp.Register(model.HostEndpointKey{}, f.OnUpdate)
+}
+
+func (f *remoteEndpointFilter) OnUpdate(update api.Update) (filterOut bool) {
+	switch key := update.Key.(type) {
+	case model.WorkloadEndpointKey:
+		if key.Hostname == f.hostname {
+			filterOut = true
+		}
+	case model.HostEndpointKey:
+		if key.Hostname == f.hostname {
+			filterOut = true
+		}
+	}
+	// Do not log for remote endpoints, since there can be many and logging each
+	// will impact performance.
 	return
 }

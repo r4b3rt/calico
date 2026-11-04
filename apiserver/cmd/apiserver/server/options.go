@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 /*
 Copyright 2017 The Kubernetes Authors.
@@ -19,29 +19,24 @@ limitations under the License.
 package server
 
 import (
-	"crypto/tls"
 	"fmt"
 	"net"
 	"os"
-	"strings"
 	"time"
 
+	"github.com/projectcalico/api/pkg/openapi"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apiserver/pkg/authorization/authorizerfactory"
 	k8sopenapi "k8s.io/apiserver/pkg/endpoints/openapi"
-	"k8s.io/apiserver/pkg/features"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/klog/v2"
-	"k8s.io/kube-openapi/pkg/validation/spec"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/logutils"
-
-	"github.com/projectcalico/api/pkg/openapi"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/projectcalico/calico/apiserver/pkg/apiserver"
+	calicotls "github.com/projectcalico/calico/crypto/pkg/tls"
 )
 
 // CalicoServerOptions contains the aggregation of configuration structs for
@@ -57,23 +52,24 @@ type CalicoServerOptions struct {
 	PrintSwagger    bool
 	SwaggerFilePath string
 
-	// Enable Admission Controller support.
-	EnableAdmissionController bool
+	// This Kubernetes feature was made default in k8s 1.30, but may not be enabled prior.
+	EnableValidatingAdmissionPolicy bool
 
 	StopCh <-chan struct{}
 }
 
-func (s *CalicoServerOptions) addFlags(flags *pflag.FlagSet) {
-	s.RecommendedOptions.AddFlags(flags)
-	flags.BoolVar(&s.EnableAdmissionController, "enable-admission-controller-support", s.EnableAdmissionController,
-		"If true, admission controller hooks will be enabled.")
-	flags.BoolVar(&s.PrintSwagger, "print-swagger", false,
+func (o *CalicoServerOptions) addFlags(flags *pflag.FlagSet) {
+	o.RecommendedOptions.AddFlags(flags)
+
+	flags.BoolVar(&o.PrintSwagger, "print-swagger", false,
 		"If true, prints swagger to stdout and exits.")
-	flags.StringVar(&s.SwaggerFilePath, "swagger-file-path", "./",
+	flags.StringVar(&o.SwaggerFilePath, "swagger-file-path", "./",
 		"If print-swagger is set true, then write swagger.json to location specified. Default is current directory.")
+	flags.BoolVar(&o.EnableValidatingAdmissionPolicy, "enable-validating-admission-policy", true,
+		"If true, establishes watches for ValidatingAdmissionPolicy at startup.")
 }
 
-func (o CalicoServerOptions) Validate(args []string) error {
+func (o *CalicoServerOptions) Validate(args []string) error {
 	errors := []error{}
 	errors = append(errors, o.RecommendedOptions.Validate()...)
 	return utilerrors.NewAggregate(errors)
@@ -90,41 +86,52 @@ func (o *CalicoServerOptions) Config() (*apiserver.Config, error) {
 	}
 
 	serverConfig := genericapiserver.NewRecommendedConfig(apiserver.Codecs)
-	serverConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(openapi.GetOpenAPIDefinitions, k8sopenapi.NewDefinitionNamer(apiserver.Scheme))
-	if serverConfig.OpenAPIConfig.Info == nil {
-		serverConfig.OpenAPIConfig.Info = &spec.Info{}
+	namer := k8sopenapi.NewDefinitionNamer(apiserver.Scheme)
+	version := "unversioned"
+	if serverConfig.EffectiveVersion != nil {
+		version = serverConfig.EffectiveVersion.EmulationVersion().String()
 	}
+	serverConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(openapi.GetOpenAPIDefinitions, namer)
 	if serverConfig.OpenAPIConfig.Info.Version == "" {
-		if serverConfig.Version != nil {
-			serverConfig.OpenAPIConfig.Info.Version = strings.Split(serverConfig.Version.String(), "-")[0]
-		} else {
-			serverConfig.OpenAPIConfig.Info.Version = "unversioned"
-		}
+		serverConfig.OpenAPIConfig.Info.Version = version
+	}
+	serverConfig.OpenAPIV3Config = genericapiserver.DefaultOpenAPIV3Config(openapi.GetOpenAPIDefinitions, namer)
+	if serverConfig.OpenAPIV3Config.Info.Version == "" {
+		serverConfig.OpenAPIV3Config.Info.Version = version
 	}
 
-	if err := o.RecommendedOptions.Etcd.Complete(serverConfig.StorageObjectCountTracker, serverConfig.DrainedNotify(), serverConfig.AddPostStartHook); err != nil {
-		return nil, err
-	}
+	// k8s v1.27 enables APIServerTracing feature gate by default [1].
+	// When newETCD3Client is constructed within newETCD3Prober,
+	// otelgrpc is added as part of the tracingOpts [2]. Even with the Noop
+	// TracerProvider, we notice growing memory usage by the opentelemetry
+	// internal int64/float64 histograms. As an extension apiserver,
+	// we don't config etcd ServerList so skip the health check.
+	// [1] https://kubernetes.io/docs/concepts/cluster-administration/system-traces/#kube-apiserver-traces
+	// [2] https://github.com/kubernetes/kubernetes/blob/bee599726d8f593a23b0e22fcc01e963732ea40b/staging/src/k8s.io/apiserver/pkg/storage/storagebackend/factory/etcd3.go#L300
+	o.RecommendedOptions.Etcd.SkipHealthEndpoints = true
 	if err := o.RecommendedOptions.Etcd.ApplyTo(&serverConfig.Config); err != nil {
 		return nil, err
 	}
-	o.RecommendedOptions.Etcd.StorageConfig.Paging = utilfeature.DefaultFeatureGate.Enabled(features.APIListChunking)
 	if err := o.RecommendedOptions.SecureServing.ApplyTo(&serverConfig.SecureServing, &serverConfig.LoopbackClientConfig); err != nil {
 		return nil, err
 	}
 
-	// Explicitly setting cipher suites in order to remove deprecated ones
-	// The list is taken from https://github.com/golang/go/blob/dev.boringcrypto.go1.13/src/crypto/tls/boring.go#L54
-	cipherSuites := []uint16{
-		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	// We now build the APIServer against >= k8s v1.29.
+	// FlowControl API resources graduated to v1 in this version,
+	// so if we run this APIServer on a backlevel (<v1.29) cluster,
+	// it will never go ready, due to a failed fetch of the v1 resources.
+	o.RecommendedOptions.Features.EnablePriorityAndFairness = false
+
+	tlsCipherSuites, err := calicotls.ParseTLSCiphers(os.Getenv("TLS_CIPHER_SUITES"))
+	if err != nil {
+		return nil, err
 	}
-	serverConfig.SecureServing.CipherSuites = cipherSuites
-	serverConfig.SecureServing.MinTLSVersion = tls.VersionTLS12
+
+	serverConfig.SecureServing.CipherSuites = tlsCipherSuites
+	serverConfig.SecureServing.MinTLSVersion, err = calicotls.ParseTLSVersion(os.Getenv("TLS_MIN_VERSION"))
+	if err != nil {
+		return nil, err
+	}
 
 	if o.PrintSwagger {
 		o.DisableAuth = true
@@ -133,18 +140,31 @@ func (o *CalicoServerOptions) Config() (*apiserver.Config, error) {
 		if err := o.RecommendedOptions.Authentication.ApplyTo(&serverConfig.Authentication, serverConfig.SecureServing, serverConfig.OpenAPIConfig); err != nil {
 			return nil, err
 		}
+
+		// Prevent /readyz from bypassing authorization. This makes /readyz perform authorization against kube-apiserver,
+		// and therefore makes /readyz a better indication of whether the container is capable of handling requests.
+		var filteredAlwaysAllowPaths []string
+		for _, path := range o.RecommendedOptions.Authorization.AlwaysAllowPaths {
+			if path != "/readyz" {
+				filteredAlwaysAllowPaths = append(filteredAlwaysAllowPaths, path)
+			}
+		}
+		o.RecommendedOptions.Authorization.AlwaysAllowPaths = filteredAlwaysAllowPaths
 		if err := o.RecommendedOptions.Authorization.ApplyTo(&serverConfig.Authorization); err != nil {
 			return nil, err
 		}
 	} else {
+		// Validating Admission Policy is generally available in k8s 1.30 [1].
+		// The admission plugin "ValidatingAdmissionPolicy" fails to initialize due to
+		// a missing authorizer. When DisableAuth=true, we need a always allow authorizer
+		// to pass ValidateInitialization checks.
+		// [1] https://kubernetes.io/blog/2024/04/24/validating-admission-policy-ga/
+		serverConfig.Authorization.Authorizer = authorizerfactory.NewAlwaysAllowAuthorizer()
 		// always warn when auth is disabled, since this should only be used for testing
-		klog.Infof("Authentication and authorization disabled for testing purposes")
+		logrus.Info("Authentication and authorization disabled for testing purposes")
 	}
 
 	if err := o.RecommendedOptions.Audit.ApplyTo(&serverConfig.Config); err != nil {
-		return nil, err
-	}
-	if err := o.RecommendedOptions.Features.ApplyTo(&serverConfig.Config); err != nil {
 		return nil, err
 	}
 
@@ -152,19 +172,37 @@ func (o *CalicoServerOptions) Config() (*apiserver.Config, error) {
 		return nil, err
 	}
 
-	if initializers, err := o.RecommendedOptions.ExtraAdmissionInitializers(serverConfig); err != nil {
-		return nil, err
-	} else if err := o.RecommendedOptions.Admission.ApplyTo(&serverConfig.Config, serverConfig.SharedInformerFactory, serverConfig.ClientConfig, o.RecommendedOptions.FeatureGate, initializers...); err != nil {
+	kubeClient, err := kubernetes.NewForConfig(serverConfig.ClientConfig)
+	if err != nil {
 		return nil, err
 	}
 
-	// Extra extra config from environments.
-	//TODO(rlb): Need to unify our logging libraries
-	logrusLevel := logrus.InfoLevel
-	if env := os.Getenv("LOG_LEVEL"); env != "" {
-		logrusLevel = logutils.SafeParseLogLevel(env)
+	dynamicClient, err := dynamic.NewForConfig(serverConfig.ClientConfig)
+	if err != nil {
+		return nil, err
 	}
-	logrus.SetLevel(logrusLevel)
+
+	if err := o.RecommendedOptions.Features.ApplyTo(&serverConfig.Config, kubeClient, serverConfig.SharedInformerFactory); err != nil {
+		return nil, err
+	}
+
+	if initializers, err := o.RecommendedOptions.ExtraAdmissionInitializers(serverConfig); err != nil {
+		return nil, err
+	} else if err := o.RecommendedOptions.Admission.ApplyTo(
+		&serverConfig.Config,
+		serverConfig.SharedInformerFactory,
+		kubeClient,
+		dynamicClient,
+		o.RecommendedOptions.FeatureGate,
+		serverConfig.EffectiveVersion,
+		initializers...); err != nil {
+		return nil, err
+	}
+
+	// disable unused apiserver profiling and metrics
+	serverConfig.EnableContentionProfiling = false
+	serverConfig.EnableMetrics = false
+	serverConfig.EnableProfiling = false
 
 	minResourceRefreshInterval := 5 * time.Second
 	if env := os.Getenv("MIN_RESOURCE_REFRESH_INTERVAL"); env != "" {

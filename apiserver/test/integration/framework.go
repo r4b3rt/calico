@@ -15,35 +15,28 @@
 package integration
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
-	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"testing"
 	"time"
 
-	"k8s.io/klog/v2"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/seedrng"
-
+	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
+	calicoclient "github.com/projectcalico/api/pkg/client/clientset_generated/clientset"
+	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
 	restclient "k8s.io/client-go/rest"
-
-	v3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	calicoclient "github.com/projectcalico/api/pkg/client/clientset_generated/clientset"
 
 	"github.com/projectcalico/calico/apiserver/cmd/apiserver/server"
 	"github.com/projectcalico/calico/apiserver/pkg/apiserver"
 )
 
 const defaultEtcdPathPrefix = ""
-
-func init() {
-	seedrng.EnsureSeeded()
-}
 
 type TestServerConfig struct {
 	etcdServerList []string
@@ -57,7 +50,7 @@ func NewTestServerConfig() *TestServerConfig {
 	}
 }
 
-func withConfigGetFreshApiserverServerAndClient(
+func withConfigGetFreshAPIServerServerAndClient(
 	t *testing.T,
 	serverConfig *TestServerConfig,
 ) (*apiserver.ProjectCalicoServer,
@@ -65,7 +58,14 @@ func withConfigGetFreshApiserverServerAndClient(
 	*restclient.Config,
 	func(),
 ) {
-	securePort := rand.Intn(31743) + 1024
+	// A port the kernel picks cannot be one something else already holds, such as
+	// the etcd the tests run against, and handing over the open listener leaves
+	// no gap for anything to take it.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Error opening a listener for the server: %v", err)
+	}
+	securePort := listener.Addr().(*net.TCPAddr).Port
 	secureAddr := fmt.Sprintf("https://localhost:%d", securePort)
 	stopCh := make(chan struct{})
 	serverFailed := make(chan struct{})
@@ -77,17 +77,18 @@ func withConfigGetFreshApiserverServerAndClient(
 	t.Logf("Starting server on port: %d", securePort)
 	ro := genericoptions.NewRecommendedOptions(defaultEtcdPathPrefix, apiserver.Codecs.LegacyCodec(v3.SchemeGroupVersion))
 	ro.Etcd.StorageConfig.Transport.ServerList = serverConfig.etcdServerList
+	ro.Features.EnablePriorityAndFairness = false
 	options := &server.CalicoServerOptions{
 		RecommendedOptions: ro,
 		DisableAuth:        true,
 		StopCh:             stopCh,
 	}
-	options.RecommendedOptions.SecureServing.BindPort = securePort
+	options.RecommendedOptions.SecureServing.Listener = listener
 	options.RecommendedOptions.CoreAPI.CoreAPIKubeconfigPath = os.Getenv("KUBECONFIG")
 
-	var err error
 	pcs, err := server.PrepareServer(options)
 	if err != nil {
+		_ = listener.Close()
 		close(serverFailed)
 		t.Fatalf("Error preparing the server: %v", err)
 	}
@@ -100,7 +101,7 @@ func withConfigGetFreshApiserverServerAndClient(
 		}
 	}()
 
-	if err := waitForApiserverUp(secureAddr, serverFailed); err != nil {
+	if err := waitForAPIServerUp(secureAddr, serverFailed); err != nil {
 		t.Fatalf("%v", err)
 	}
 	if pcs == nil {
@@ -118,58 +119,35 @@ func withConfigGetFreshApiserverServerAndClient(
 	return pcs, clientset, cfg, shutdownServer
 }
 
-func getFreshApiserverServerAndClient(
-	t *testing.T,
-	newEmptyObj func() runtime.Object,
-) (*apiserver.ProjectCalicoServer, calicoclient.Interface, func()) {
+func getFreshAPIServerAndClient(t *testing.T, newEmptyObj func() runtime.Object) (calicoclient.Interface, func()) {
 	serverConfig := &TestServerConfig{
 		etcdServerList: []string{"http://localhost:2379"},
 		emptyObjFunc:   newEmptyObj,
 	}
-	pcs, client, _, shutdownFunc := withConfigGetFreshApiserverServerAndClient(t, serverConfig)
-	return pcs, client, shutdownFunc
-}
-
-func getFreshApiserverAndClient(
-	t *testing.T,
-	newEmptyObj func() runtime.Object,
-) (calicoclient.Interface, func()) {
-	serverConfig := &TestServerConfig{
-		etcdServerList: []string{"http://localhost:2379"},
-		emptyObjFunc:   newEmptyObj,
-	}
-	_, client, _, shutdownFunc := withConfigGetFreshApiserverServerAndClient(t, serverConfig)
+	_, client, _, shutdownFunc := withConfigGetFreshAPIServerServerAndClient(t, serverConfig)
 	return client, shutdownFunc
 }
 
-func customizeFreshApiserverAndClient(
-	t *testing.T,
-	serverConfig *TestServerConfig,
-) (calicoclient.Interface, func()) {
-	_, client, _, shutdownFunc := withConfigGetFreshApiserverServerAndClient(t, serverConfig)
-	return client, shutdownFunc
-}
-
-func waitForApiserverUp(serverURL string, stopCh <-chan struct{}) error {
+func waitForAPIServerUp(serverURL string, stopCh <-chan struct{}) error {
 	interval := 1 * time.Second
 	timeout := 30 * time.Second
 	startWaiting := time.Now()
 	tries := 0
-	return wait.PollImmediate(interval, timeout,
-		func() (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), interval, timeout, true,
+		func(ctx context.Context) (bool, error) {
 			select {
 			// we've been told to stop, so no reason to keep going
 			case <-stopCh:
 				return true, fmt.Errorf("apiserver failed")
 			default:
-				klog.Infof("Waiting for : %#v", serverURL)
+				logrus.Infof("Waiting for : %#v", serverURL)
 				tr := &http.Transport{
 					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 				}
 				c := &http.Client{Transport: tr}
 				_, err := c.Get(serverURL)
 				if err == nil {
-					klog.Infof("Found server after %v tries and duration %v",
+					logrus.Tracef("Found server after %v tries and duration %v",
 						tries, time.Since(startWaiting))
 					return true, nil
 				}

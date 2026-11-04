@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,25 +17,26 @@ package calc
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"time"
 
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/sirupsen/logrus"
 
-	apiv3 "github.com/projectcalico/calico/libcalico-go/lib/apis/v3"
+	"github.com/projectcalico/calico/felix/dispatcher"
+	"github.com/projectcalico/calico/felix/ip"
+	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/encap"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 	cresources "github.com/projectcalico/calico/libcalico-go/lib/resources"
 	"github.com/projectcalico/calico/libcalico-go/lib/set"
-
-	"github.com/projectcalico/calico/felix/dispatcher"
-	"github.com/projectcalico/calico/felix/ip"
-	"github.com/projectcalico/calico/felix/proto"
 )
 
-// L3RouteResolver is responsible for indexing (currently only IPv4 versions of):
+// L3RouteResolver is responsible for indexing :
 //
 // - IPAM blocks
 // - IP pools
@@ -46,7 +47,7 @@ import (
 // - The relevant destination CIDR.
 // - The IP pool type that contains the CIDR (or none).
 // - Other metadata about the containing IP pool.
-// - Whether this (/32) CIDR is a host or not.
+// - Whether this (/32) CIDR is a host or not. (or /128 for IPv6)
 // - For workload CIDRs, the IP and name of the host that contains the workload.
 //
 // The BPF dataplane use the above to form a map of IP space so it can look up whether a particular
@@ -61,13 +62,12 @@ type L3RouteResolver struct {
 
 	// Store node metadata indexed by node name, and routes by the
 	// block that contributed them.
-	nodeNameToNodeInfo     map[string]l3rrNodeInfo
-	blockToRoutes          map[string]set.Set[nodenameRoute]
-	nodeRoutes             nodeRoutes
-	allPools               map[string]model.IPPool
-	workloadIDToCIDRs      map[model.WorkloadEndpointKey][]cnet.IPNet
-	useNodeResourceUpdates bool
-	routeSource            string
+	nodeNameToNodeInfo map[string]l3rrNodeInfo
+	blockToRoutes      map[string]set.Set[nodenameRoute]
+	nodeRoutes         nodeRoutes
+	allPools           map[string]l3rrPoolInfo
+	workloadIDToCIDRs  map[model.WorkloadEndpointKey][]cnet.IPNet
+	routeSource        string
 
 	OnAlive        func()
 	lastLiveReport time.Time
@@ -88,6 +88,14 @@ type l3rrNodeInfo struct {
 	WireguardV6Addr ip.Addr
 
 	Addresses []ip.Addr
+}
+
+type l3rrPoolInfo struct {
+	CIDR        ip.CIDR
+	PoolType    proto.IPPoolType
+	NATOutgoing bool
+	CrossSubnet bool
+	AWSSubnetID string
 }
 
 var (
@@ -115,7 +123,7 @@ func (i l3rrNodeInfo) Equal(b l3rrNodeInfo) bool {
 		l := len(i.Addresses)
 		for ia, a := range i.Addresses {
 			found := false
-			for j := 0; j < l; j++ {
+			for j := range l {
 				if a == b.Addresses[(ia+j)%l] {
 					found = true
 					break
@@ -146,9 +154,9 @@ func (i l3rrNodeInfo) AddressesAsCIDRs() []ip.CIDR {
 		addrs[a] = struct{}{}
 	}
 
-	// Clean up empty (uninitialized) addresses
+	// Clean up empty (uninitialized) or nil addresses
 	for a := range addrs {
-		if a == emptyV4Addr || a == emptyV6Addr {
+		if a == nil || a == emptyV4Addr || a == emptyV6Addr {
 			delete(addrs, a)
 		}
 	}
@@ -163,7 +171,7 @@ func (i l3rrNodeInfo) AddressesAsCIDRs() []ip.CIDR {
 	return cidrs
 }
 
-func NewL3RouteResolver(hostname string, callbacks PipelineCallbacks, useNodeResourceUpdates bool, routeSource string) *L3RouteResolver {
+func NewL3RouteResolver(hostname string, callbacks routeCallbacks, routeSource string) *L3RouteResolver {
 	logrus.Info("Creating L3 route resolver")
 	l3rr := &L3RouteResolver{
 		myNodeName: hostname,
@@ -171,27 +179,19 @@ func NewL3RouteResolver(hostname string, callbacks PipelineCallbacks, useNodeRes
 
 		trie: NewRouteTrie(),
 
-		nodeNameToNodeInfo:     map[string]l3rrNodeInfo{},
-		blockToRoutes:          map[string]set.Set[nodenameRoute]{},
-		allPools:               map[string]model.IPPool{},
-		workloadIDToCIDRs:      map[model.WorkloadEndpointKey][]cnet.IPNet{},
-		useNodeResourceUpdates: useNodeResourceUpdates,
-		routeSource:            routeSource,
-		nodeRoutes:             newNodeRoutes(),
+		nodeNameToNodeInfo: map[string]l3rrNodeInfo{},
+		blockToRoutes:      map[string]set.Set[nodenameRoute]{},
+		allPools:           map[string]l3rrPoolInfo{},
+		workloadIDToCIDRs:  map[model.WorkloadEndpointKey][]cnet.IPNet{},
+		routeSource:        routeSource,
+		nodeRoutes:         newNodeRoutes(),
 	}
 	l3rr.trie.OnAlive = l3rr.maybeReportLive
 	return l3rr
 }
 
 func (c *L3RouteResolver) RegisterWith(allUpdDispatcher, localDispatcher *dispatcher.Dispatcher) {
-	if c.useNodeResourceUpdates {
-		logrus.Info("Registering L3 route resolver (node resources on)")
-		allUpdDispatcher.Register(model.ResourceKey{}, c.OnResourceUpdate)
-	} else {
-		logrus.Info("Registering L3 route resolver (node resources off)")
-		allUpdDispatcher.Register(model.HostIPKey{}, c.OnHostIPUpdate)
-	}
-
+	allUpdDispatcher.Register(model.ResourceKey{}, c.OnResourceUpdate)
 	allUpdDispatcher.Register(model.IPPoolKey{}, c.OnPoolUpdate)
 
 	// Depending on if we're using workload endpoints for routing information, we may
@@ -260,39 +260,39 @@ func (c *L3RouteResolver) OnBlockUpdate(update api.Update) (_ bool) {
 	// Update the routes map based on the provided block update.
 	key := update.Key.String()
 
-	deletes := set.NewBoxed[nodenameRoute]()
-	adds := set.NewBoxed[nodenameRoute]()
+	deletes := set.New[nodenameRoute]()
+	adds := set.New[nodenameRoute]()
 	if update.Value != nil {
 		// Block has been created or updated.
 		// We don't allow multiple blocks with the same CIDR, so no need to check
 		// for duplicates here. Look at the routes contributed by this block and determine if we
 		// need to send any updates.
-		newRoutes := c.routesFromBlock(update.Value.(*model.AllocationBlock))
+		newRoutes := c.routesFromBlock(update)
 		logrus.WithField("numRoutes", len(newRoutes)).Debug("IPAM block update")
 		cachedRoutes, ok := c.blockToRoutes[key]
 		if !ok {
-			cachedRoutes = set.NewBoxed[nodenameRoute]()
+			cachedRoutes = set.New[nodenameRoute]()
 			c.blockToRoutes[key] = cachedRoutes
 		}
 
 		// Now scan the old routes, looking for any that are no-longer associated with the block.
 		// Remove no longer active routes from the cache and queue up deletions.
-		cachedRoutes.Iter(func(r nodenameRoute) error {
+		for r := range cachedRoutes.All() {
 			c.maybeReportLive()
 			// For each existing route which is no longer present, we need to delete it.
 			// Note: since r.Key() only contains the destination, we need to check equality too in case
 			// the gateway has changed.
 			if newRoute, ok := newRoutes[r.Key()]; ok && newRoute == r {
 				// Exists, and we want it to - nothing to do.
-				return nil
+				continue
 			}
 
 			// Current route is not in new set - we need to withdraw the route, and also
 			// remove it from internal state.
 			deletes.Add(r)
 			logrus.WithField("route", r).Debug("Found stale route")
-			return set.RemoveItem
-		})
+			cachedRoutes.Discard(r)
+		}
 
 		// Now scan the new routes, looking for additions.  Cache them and queue up adds.
 		for _, r := range newRoutes {
@@ -310,25 +310,22 @@ func (c *L3RouteResolver) OnBlockUpdate(update api.Update) (_ bool) {
 
 		// At this point we've determined the correct diff to perform based on the block update. Queue up
 		// updates.
-		deletes.Iter(func(nr nodenameRoute) error {
+		for nr := range deletes.All() {
 			c.trie.RemoveBlockRoute(nr.dst)
 			c.nodeRoutes.Remove(nr)
-			return nil
-		})
-		adds.Iter(func(nr nodenameRoute) error {
+		}
+		for nr := range adds.All() {
 			c.trie.UpdateBlockRoute(nr.dst, nr.nodeName)
 			c.nodeRoutes.Add(nr)
-			return nil
-		})
+		}
 	} else {
 		// Block has been deleted. Clean up routes that were contributed by this block.
 		logrus.WithField("update", update).Debug("IPAM block deleted")
 		routes := c.blockToRoutes[key]
 		if routes != nil {
-			routes.Iter(func(nr nodenameRoute) error {
+			for nr := range routes.All() {
 				c.trie.RemoveBlockRoute(nr.dst)
-				return nil
-			})
+			}
 		}
 		delete(c.blockToRoutes, key)
 	}
@@ -338,7 +335,7 @@ func (c *L3RouteResolver) OnBlockUpdate(update api.Update) (_ bool) {
 func (c *L3RouteResolver) OnResourceUpdate(update api.Update) (_ bool) {
 	// We only care about nodes, not other resources.
 	resourceKey := update.Key.(model.ResourceKey)
-	if resourceKey.Kind != apiv3.KindNode {
+	if resourceKey.Kind != internalapi.KindNode {
 		return
 	}
 
@@ -354,7 +351,7 @@ func (c *L3RouteResolver) OnResourceUpdate(update api.Update) (_ bool) {
 	// Update our tracking data structures.
 	var nodeInfo *l3rrNodeInfo
 	if update.Value != nil {
-		node := update.Value.(*apiv3.Node)
+		node := update.Value.(*internalapi.Node)
 		if node.Spec.BGP != nil && (node.Spec.BGP.IPv4Address != "" || node.Spec.BGP.IPv6Address != "") {
 			bgp := node.Spec.BGP
 			nodeInfo = &l3rrNodeInfo{}
@@ -377,13 +374,13 @@ func (c *L3RouteResolver) OnResourceUpdate(update api.Update) (_ bool) {
 				nodeInfo.V6CIDR = ip.CIDRFromCalicoNet(*caliNodeCIDRV6).(ip.V6CIDR)
 			}
 		} else {
-			ipv4, caliNodeCIDR := cresources.FindNodeAddress(node, apiv3.InternalIP, 4)
+			ipv4, caliNodeCIDR := cresources.FindNodeAddress(node, internalapi.InternalIP, 4)
 			if ipv4 == nil {
-				ipv4, caliNodeCIDR = cresources.FindNodeAddress(node, apiv3.ExternalIP, 4)
+				ipv4, caliNodeCIDR = cresources.FindNodeAddress(node, internalapi.ExternalIP, 4)
 			}
-			ipv6, caliNodeCIDRV6 := cresources.FindNodeAddress(node, apiv3.InternalIP, 6)
+			ipv6, caliNodeCIDRV6 := cresources.FindNodeAddress(node, internalapi.InternalIP, 6)
 			if ipv6 == nil {
-				ipv6, caliNodeCIDRV6 = cresources.FindNodeAddress(node, apiv3.ExternalIP, 6)
+				ipv6, caliNodeCIDRV6 = cresources.FindNodeAddress(node, internalapi.ExternalIP, 6)
 			}
 			hasIPv4 := (ipv4 != nil && caliNodeCIDR != nil)
 			hasIPv6 := (ipv6 != nil && caliNodeCIDRV6 != nil)
@@ -433,30 +430,6 @@ func (c *L3RouteResolver) OnResourceUpdate(update api.Update) (_ bool) {
 	}
 
 	c.onNodeUpdate(nodeName, nodeInfo)
-
-	return
-}
-
-// OnHostIPUpdate gets called whenever a node IP address changes.
-func (c *L3RouteResolver) OnHostIPUpdate(update api.Update) (_ bool) {
-	// Queue up a flush.
-	defer c.flush()
-
-	nodeName := update.Key.(model.HostIPKey).Hostname
-	logrus.WithField("node", nodeName).Debug("OnHostIPUpdate triggered")
-
-	var newNodeInfo *l3rrNodeInfo
-	if update.Value != nil {
-		newCaliIP := update.Value.(*cnet.IP)
-		v4Addr, ok := ip.FromCalicoIP(*newCaliIP).(ip.V4Addr)
-		if ok { // Defensive; we only expect an IPv4.
-			newNodeInfo = &l3rrNodeInfo{
-				V4Addr: v4Addr,
-				V4CIDR: v4Addr.AsCIDR().(ip.V4CIDR), // Don't know the CIDR so use the /32.
-			}
-		}
-	}
-	c.onNodeUpdate(nodeName, newNodeInfo)
 
 	return
 }
@@ -583,7 +556,7 @@ func (c *L3RouteResolver) markAllNodeRoutesDirty(nodeName string) {
 }
 
 func (c *L3RouteResolver) visitAllRoutes(trie *ip.CIDRTrie, v func(route nodenameRoute)) {
-	trie.Visit(func(cidr ip.CIDR, data interface{}) bool {
+	trie.Visit(func(cidr ip.CIDR, data any) bool {
 		c.maybeReportLive()
 
 		// Construct a nodenameRoute to pass to the visiting function.
@@ -592,9 +565,9 @@ func (c *L3RouteResolver) visitAllRoutes(trie *ip.CIDRTrie, v func(route nodenam
 		if len(ri.Refs) > 0 {
 			// From a Ref.
 			nnr.nodeName = ri.Refs[0].NodeName
-		} else if ri.Block.NodeName != "" {
+		} else if len(ri.Blocks) > 0 {
 			// From IPAM.
-			nnr.nodeName = ri.Block.NodeName
+			nnr.nodeName = ri.Blocks[0].NodeName
 		} else {
 			// No host associated with route.
 			return true
@@ -613,49 +586,81 @@ func (c *L3RouteResolver) OnPoolUpdate(update api.Update) (_ bool) {
 	k := update.Key.(model.IPPoolKey)
 	poolKey := k.String()
 	oldPool, oldPoolExists := c.allPools[poolKey]
-	oldPoolType := proto.IPPoolType_NONE
-	var poolCIDR ip.CIDR
-	if oldPoolExists {
-		// Need explicit oldPoolExists check so that we don't pass a zero-struct to poolTypeForPool.
-		oldPoolType = c.poolTypeForPool(&oldPool)
-		poolCIDR = ip.CIDRFromCalicoNet(oldPool.CIDR)
-	}
-	var newPool *model.IPPool
+	var newPool *l3rrPoolInfo
 	if update.Value != nil {
-		newPool = update.Value.(*model.IPPool)
+		newPool = c.getPoolInfo(update)
 	}
-	newPoolType := c.poolTypeForPool(newPool)
-	logCxt := logrus.WithFields(logrus.Fields{"oldType": oldPoolType, "newType": newPoolType})
-	if newPool != nil && newPoolType != proto.IPPoolType_NONE {
-		logCxt.Info("Pool is active")
+	if newPool != nil {
+		logrus.WithFields(logrus.Fields{
+			"oldType": oldPool.PoolType,
+			"newType": newPool.PoolType,
+			"newPool": *newPool,
+		}).Info("Pool update")
 		c.allPools[poolKey] = *newPool
-		poolCIDR = ip.CIDRFromCalicoNet(newPool.CIDR)
-		crossSubnet := newPool.IPIPMode == encap.CrossSubnet || newPool.VXLANMode == encap.CrossSubnet
-		c.trie.UpdatePool(poolCIDR, newPoolType, newPool.Masquerade, crossSubnet)
-	} else {
+		c.trie.UpdatePool(newPool.CIDR, newPool.PoolType, newPool.NATOutgoing, newPool.CrossSubnet)
+	} else if oldPoolExists {
 		delete(c.allPools, poolKey)
-		c.trie.RemovePool(poolCIDR)
+		c.trie.RemovePool(oldPool.CIDR)
 	}
 
 	return
+}
+
+func (c *L3RouteResolver) getPoolInfo(update api.Update) *l3rrPoolInfo {
+	var v1Pool *model.IPPool
+	switch v := update.Value.(type) {
+	case *model.IPPool:
+		v1Pool = v
+	default:
+		logrus.Panic("Encountered unexpected value type when handling Pool update")
+	}
+
+	return &l3rrPoolInfo{
+		CIDR:        ip.CIDRFromCalicoNet(v1Pool.CIDR),
+		PoolType:    c.poolTypeForPool(v1Pool),
+		NATOutgoing: v1Pool.Masquerade,
+		CrossSubnet: v1Pool.IPIPMode == encap.CrossSubnet || v1Pool.VXLANMode == encap.CrossSubnet,
+	}
 }
 
 func (c *L3RouteResolver) poolTypeForPool(pool *model.IPPool) proto.IPPoolType {
 	if pool == nil {
 		return proto.IPPoolType_NONE
 	}
-	if pool.VXLANMode != encap.Undefined {
+	if isLoadBalancerOnlyPool(pool) {
+		return proto.IPPoolType_NONE
+	}
+	if pool.VXLANMode != encap.Never {
 		return proto.IPPoolType_VXLAN
 	}
-	if pool.IPIPMode != encap.Undefined {
+	if pool.IPIPMode != encap.Never {
 		return proto.IPPoolType_IPIP
 	}
 	return proto.IPPoolType_NO_ENCAP
 }
 
+// isLoadBalancerOnlyPool returns true if the pool's AllowedUses contains only
+// "LoadBalancer". Such pools should not contribute to route pool type because
+// their CIDRs do not represent workload/tunnel addresses and traffic destined
+// to them should still be masqueraded (not exempted from SNAT via the
+// FlagInIPAMPool BPF route flag or the network-ip-pools ipset).
+//
+// NOTE: keep in sync with isLoadBalancerOnly in felix/dataplane/linux/masq_mgr.go.
+func isLoadBalancerOnlyPool(pool *model.IPPool) bool {
+	return len(pool.AllowedUses) == 1 && slices.Contains(pool.AllowedUses, apiv3.IPPoolAllowedUseLoadBalancer)
+}
+
 // routesFromBlock returns a list of routes which should exist based on the provided
 // allocation block.
-func (c *L3RouteResolver) routesFromBlock(b *model.AllocationBlock) map[string]nodenameRoute {
+func (c *L3RouteResolver) routesFromBlock(update api.Update) map[string]nodenameRoute {
+	var b *model.AllocationBlock
+	switch k := update.Key.(type) {
+	case model.BlockKey:
+		b = update.Value.(*model.AllocationBlock)
+	default:
+		logrus.WithField("key", k).Panic("Unexpected key type for Block update")
+	}
+
 	routes := make(map[string]nodenameRoute)
 	for _, alloc := range b.NonAffineAllocations() {
 		if alloc.Host == "" {
@@ -687,7 +692,7 @@ func (c *L3RouteResolver) routesFromBlock(b *model.AllocationBlock) map[string]n
 // that it finds.
 func (c *L3RouteResolver) flush() {
 	var buf []ip.CIDRTrieEntry
-	c.trie.dirtyCIDRs.Iter(func(cidr ip.CIDR) error {
+	for cidr := range c.trie.dirtyCIDRs.All() {
 		logCxt := logrus.WithField("cidr", cidr)
 		logCxt.Debug("Flushing dirty route")
 		trie := c.trie.trieForCIDR(cidr)
@@ -704,7 +709,8 @@ func (c *L3RouteResolver) flush() {
 		if len(buf) == 0 {
 			// CIDR is not in the trie.  Nothing to do.  Route removed before it had even been sent?
 			logCxt.Debug("CIDR not in trie, ignoring.")
-			return set.RemoveItem
+			c.trie.dirtyCIDRs.Discard(cidr)
+			continue
 		}
 
 		// Otherwise, check if the route is removed.
@@ -713,48 +719,78 @@ func (c *L3RouteResolver) flush() {
 			logCxt.Debug("CIDR was sent before but now needs to be removed.")
 			c.callbacks.OnRouteRemove(cidr.String())
 			c.trie.SetRouteSent(cidr, false)
-			return set.RemoveItem
+			c.trie.dirtyCIDRs.Discard(cidr)
+			continue
 		}
 
 		rt := &proto.RouteUpdate{
-			Type:       proto.RouteType_CIDR_INFO,
 			IpPoolType: proto.IPPoolType_NONE,
 			Dst:        cidr.String(),
 		}
 		poolAllowsCrossSubnet := false
+		var blockSeen bool
+		var blockNodeName string
+		var blockTypes proto.RouteType
+		var blockMatchesRoute bool
+		var hasTunnelRef bool
+		var hasHostRef bool
 		for _, entry := range buf {
 			ri := entry.Data.(RouteInfo)
-			if ri.Pool.Type != proto.IPPoolType_NONE {
-				logCxt.WithField("type", ri.Pool.Type).Debug("Found containing IP pool.")
-				rt.IpPoolType = ri.Pool.Type
+			if len(ri.Pools) > 0 {
+				// We only expect one Pool entry for any given CIDR. This constraint is upheld by the datastore.
+				if ri.Pools[0].Type != proto.IPPoolType_NONE {
+					logCxt.WithField("type", ri.Pools[0].Type).Debug("Found containing IP pool.")
+					rt.IpPoolType = ri.Pools[0].Type
+				}
+				if ri.Pools[0].NATOutgoing {
+					logCxt.Debug("NAT outgoing enabled on this CIDR.")
+					rt.NatOutgoing = true
+				}
+				if ri.Pools[0].CrossSubnet {
+					logCxt.Debug("Cross-subnet enabled on this CIDR.")
+					poolAllowsCrossSubnet = true
+				}
 			}
-			if ri.Pool.NATOutgoing {
-				logCxt.Debug("NAT outgoing enabled on this CIDR.")
-				rt.NatOutgoing = true
-			}
-			if ri.Pool.CrossSubnet {
-				logCxt.Debug("Cross-subnet enabled on this CIDR.")
-				poolAllowsCrossSubnet = true
-			}
-			if ri.Block.NodeName != "" {
-				rt.DstNodeName = ri.Block.NodeName
-				if rt.DstNodeName == c.myNodeName {
-					logCxt.Debug("Local workload route.")
-					rt.Type = proto.RouteType_LOCAL_WORKLOAD
+			if len(ri.Blocks) > 0 {
+				// We only expect one Block entry for any given CIDR. This constraint is upheld by the datastore.
+				if blockSeen && blockNodeName != ri.Blocks[0].NodeName {
+					logCxt.Debug("Borrowed block IP")
+					rt.Borrowed = true
 				} else {
-					logCxt.Debug("Remote workload route.")
-					rt.Type = proto.RouteType_REMOTE_WORKLOAD
+					blockSeen = true
+					blockNodeName = ri.Blocks[0].NodeName
+				}
+				rt.DstNodeName = ri.Blocks[0].NodeName
+
+				// Track whether this block entry is at the same CIDR as the route we're
+				// resolving (e.g., a /32 block for a /32 tunnel IP from a dedicated tunnel
+				// pool) vs a parent block that merely contains it.
+				if entry.CIDR == cidr {
+					blockMatchesRoute = true
+				}
+
+				// Accumulate the workload type flags from block entries, but don't apply
+				// them to the route yet. A parent block entry (e.g., a /26 block containing
+				// a /32 tunnel IP) should not contribute REMOTE_WORKLOAD to a tunnel route.
+				// The flags are applied after the full trie walk; see below.
+				if ri.Blocks[0].NodeName == c.myNodeName {
+					logCxt.Debug("Local workload route (from block).")
+					blockTypes |= proto.RouteType_LOCAL_WORKLOAD
+				} else {
+					logCxt.Debug("Remote workload route (from block).")
+					blockTypes |= proto.RouteType_REMOTE_WORKLOAD
 				}
 			}
 			if len(ri.Host.NodeNames) > 0 {
 				rt.DstNodeName = ri.Host.NodeNames[0]
+				hasHostRef = true
 
 				if rt.DstNodeName == c.myNodeName {
 					logCxt.Debug("Local host route.")
-					rt.Type = proto.RouteType_LOCAL_HOST
+					rt.Types |= proto.RouteType_LOCAL_HOST
 				} else {
 					logCxt.Debug("Remote host route.")
-					rt.Type = proto.RouteType_REMOTE_HOST
+					rt.Types |= proto.RouteType_REMOTE_HOST
 				}
 			}
 
@@ -765,21 +801,29 @@ func (c *L3RouteResolver) flush() {
 				// multiple workload, or workload and tunnel, or multiple node Refs with the same IP. Since this will be
 				// transient, we can always just use the first entry (and related tunnel entries)
 				rt.DstNodeName = ri.Refs[0].NodeName
+				if blockSeen && blockNodeName != rt.DstNodeName {
+					logCxt.Debug("Borrowed ref IP")
+					rt.Borrowed = true
+				}
 				if ri.Refs[0].RefType == RefTypeWEP {
-					// This is not a tunnel ref, so must be a workload.
+					// This is explicitly a workload endpoint.
 					if ri.Refs[0].NodeName == c.myNodeName {
-						rt.Type = proto.RouteType_LOCAL_WORKLOAD
+						// Flag that there's a live WEP on this IP; this avoids
+						// confusion in the dataplane if we have borrowed IPs
+						// (which get flagged as both local and remote!).
 						rt.LocalWorkload = true
+						rt.Types |= proto.RouteType_LOCAL_WORKLOAD
 					} else {
-						rt.Type = proto.RouteType_REMOTE_WORKLOAD
+						rt.Types |= proto.RouteType_REMOTE_WORKLOAD
 					}
 				} else {
 					// This is a tunnel ref, set type and also store the tunnel type in the route. It is possible for
 					// multiple tunnels to have the same IP, so collate all tunnel types on the same node.
+					hasTunnelRef = true
 					if ri.Refs[0].NodeName == c.myNodeName {
-						rt.Type = proto.RouteType_LOCAL_TUNNEL
+						rt.Types |= proto.RouteType_LOCAL_TUNNEL
 					} else {
-						rt.Type = proto.RouteType_REMOTE_TUNNEL
+						rt.Types |= proto.RouteType_REMOTE_TUNNEL
 					}
 
 					rt.TunnelType = &proto.TunnelType{}
@@ -802,10 +846,29 @@ func (c *L3RouteResolver) flush() {
 			}
 		}
 
+		// Apply the accumulated block workload type flags, with two exceptions.
+		//
+		// A host IP never inherits the workload type from a containing block, even one at
+		// its exact CIDR. It's reachable via its own host route; tagging it REMOTE_WORKLOAD
+		// makes the route manager program the node's own IP via the tunnel device, which
+		// breaks connectivity to the node.
+		//
+		// A tunnel IP that merely falls within a larger parent block (e.g. a /32 inside a
+		// /24) also skips the workload type, since REMOTE_WORKLOAD makes
+		// isRemoteTunnelRoute() program a spurious /32 route. A tunnel IP whose block is at
+		// the same CIDR (a dedicated /32 tunnel pool) still needs it, so the route manager
+		// programs the correct directly-connected route.
+		if blockSeen && !hasHostRef && (blockMatchesRoute || !hasTunnelRef) {
+			rt.Types |= blockTypes
+		}
+
+		var ipFamily int
+
 		if rt.DstNodeName != "" {
 			dstNodeInfo, exists := c.nodeNameToNodeInfo[rt.DstNodeName]
 			if exists {
-				switch cidr.Version() {
+				ipFamily = int(cidr.Version())
+				switch ipFamily {
 				case 4:
 					if dstNodeInfo.V4Addr != emptyV4Addr {
 						rt.DstNodeIp = dstNodeInfo.V4Addr.String()
@@ -819,7 +882,7 @@ func (c *L3RouteResolver) flush() {
 				}
 			}
 		}
-		rt.SameSubnet = poolAllowsCrossSubnet && c.nodeInOurSubnet(rt.DstNodeName)
+		rt.SameSubnet = poolAllowsCrossSubnet && c.nodeInOurSubnet(rt.DstNodeName, ipFamily)
 
 		if rt.Dst != emptyV4Addr.AsCIDR().String() && rt.Dst != emptyV6Addr.AsCIDR().String() {
 			// Skip sending a route for an empty CIDR
@@ -828,13 +891,13 @@ func (c *L3RouteResolver) flush() {
 			c.trie.SetRouteSent(cidr, true)
 		}
 
-		return set.RemoveItem
-	})
+		c.trie.dirtyCIDRs.Discard(cidr)
+	}
 }
 
 // nodeInOurSubnet returns true if the IP of the given node is known and it's in our subnet.
 // Return false if either the remote IP or our subnet is not known.
-func (c *L3RouteResolver) nodeInOurSubnet(name string) bool {
+func (c *L3RouteResolver) nodeInOurSubnet(name string, ipFamily int) bool {
 	localNodeInfo, exists := c.nodeNameToNodeInfo[c.myNodeName]
 	if !exists {
 		return false
@@ -845,10 +908,14 @@ func (c *L3RouteResolver) nodeInOurSubnet(name string) bool {
 		return false
 	}
 
-	sameV4 := localNodeInfo.V4CIDR.ContainsV4(nodeInfo.V4Addr)
-	sameV6 := localNodeInfo.V6CIDR != ip.V6CIDR{} && nodeInfo.V6Addr != ip.V6Addr{} && localNodeInfo.V6CIDR.ContainsV6(nodeInfo.V6Addr)
+	switch ipFamily {
+	case 4:
+		return localNodeInfo.V4CIDR != ip.V4CIDR{} && localNodeInfo.V4CIDR.ContainsV4(nodeInfo.V4Addr)
+	case 6:
+		return localNodeInfo.V6CIDR != ip.V6CIDR{} && localNodeInfo.V6CIDR.ContainsV6(nodeInfo.V6Addr)
+	}
 
-	return sameV4 || sameV6
+	return false
 }
 
 func (c *L3RouteResolver) maybeReportLive() {
@@ -910,7 +977,7 @@ func NewRouteTrie() *RouteTrie {
 	return &RouteTrie{
 		v4T:        ip.NewCIDRTrie(),
 		v6T:        ip.NewCIDRTrie(),
-		dirtyCIDRs: set.NewBoxed[ip.CIDR](),
+		dirtyCIDRs: set.New[ip.CIDR](),
 
 		OnAlive: func() {},
 	}
@@ -924,9 +991,17 @@ func (r *RouteTrie) UpdatePool(cidr ip.CIDR, poolType proto.IPPoolType, natOutgo
 		"crossSubnet": crossSubnet,
 	}).Debug("IP pool update")
 	changed := r.updateCIDR(cidr, func(ri *RouteInfo) {
-		ri.Pool.Type = poolType
-		ri.Pool.NATOutgoing = natOutgoing
-		ri.Pool.CrossSubnet = crossSubnet
+		newPool := Pool{
+			Type:        poolType,
+			NATOutgoing: natOutgoing,
+			CrossSubnet: crossSubnet,
+		}
+
+		if len(ri.Pools) == 0 {
+			ri.Pools = append(ri.Pools, newPool)
+		} else {
+			ri.Pools[0] = newPool
+		}
 	})
 	if !changed {
 		return
@@ -937,7 +1012,7 @@ func (r *RouteTrie) UpdatePool(cidr ip.CIDR, poolType proto.IPPoolType, natOutgo
 func (r *RouteTrie) markChildrenDirty(cidr ip.CIDR) {
 	// TODO: avoid full scan to mark children dirty
 	trie := r.trieForCIDR(cidr)
-	trie.Visit(func(c ip.CIDR, data interface{}) bool {
+	trie.Visit(func(c ip.CIDR, data any) bool {
 		r.OnAlive()
 		if cidr.Contains(c.Addr()) {
 			r.MarkCIDRDirty(c)
@@ -951,17 +1026,33 @@ func (r *RouteTrie) MarkCIDRDirty(cidr ip.CIDR) {
 }
 
 func (r *RouteTrie) RemovePool(cidr ip.CIDR) {
-	r.UpdatePool(cidr, proto.IPPoolType_NONE, false, false)
+	changed := r.updateCIDR(cidr, func(ri *RouteInfo) {
+		// The datastore constraints guarantee that we only see one Pool for a CIDR.
+		ri.Pools = nil
+	})
+	if !changed {
+		return
+	}
+	r.markChildrenDirty(cidr)
 }
 
 func (r *RouteTrie) UpdateBlockRoute(cidr ip.CIDR, nodeName string) {
 	r.updateCIDR(cidr, func(ri *RouteInfo) {
-		ri.Block.NodeName = nodeName
+		block := Block{NodeName: nodeName}
+
+		if len(ri.Blocks) == 0 {
+			ri.Blocks = append(ri.Blocks, block)
+		} else {
+			ri.Blocks[0] = block
+		}
 	})
 }
 
 func (r *RouteTrie) RemoveBlockRoute(cidr ip.CIDR) {
-	r.UpdateBlockRoute(cidr, "")
+	r.updateCIDR(cidr, func(ri *RouteInfo) {
+		// The datastore constraints guarantee that we only see one Block for a CIDR.
+		ri.Blocks = nil
+	})
 }
 
 func (r *RouteTrie) AddHost(cidr ip.CIDR, nodeName string) {
@@ -1109,17 +1200,13 @@ func (r *RouteTrie) trieForCIDR(cidr ip.CIDR) *ip.CIDRTrie {
 }
 
 type RouteInfo struct {
-	// Pool contains information extracted from the IP pool that has this CIDR.
-	Pool struct {
-		Type        proto.IPPoolType // Only set if this CIDR represents an IP pool
-		NATOutgoing bool
-		CrossSubnet bool
-	}
+	// Pools contains information extracted from the local and remote IP pools that have this CIDR.
+	// Since the datastore guarantees that pools have unique CIDRs within the cluster, we only expect one entry.
+	Pools []Pool
 
-	// Block contains route information extracted from IPAM blocks.
-	Block struct {
-		NodeName string // Set for each route that comes from an IPAM block.
-	}
+	// Blocks contains route information extracted from local and remote IPAM blocks.
+	// Since the datastore guarantees that blocks have unique CIDRs within the cluster, we only expect one entry.
+	Blocks []Block
 
 	// Host contains information extracted from the node/host config updates.
 	Host struct {
@@ -1142,6 +1229,16 @@ const (
 	RefTypeVXLAN
 )
 
+type Pool struct {
+	Type        proto.IPPoolType // Only set if this CIDR represents an IP pool
+	NATOutgoing bool
+	CrossSubnet bool
+}
+
+type Block struct {
+	NodeName string // Set for each route that comes from an IPAM block.
+}
+
 type Ref struct {
 	// Count of Refs that have this CIDR.  Normally, for WEPs this will be 0 or 1 but Felix has to be tolerant
 	// to bad data (two Refs with the same CIDR) so we do ref counting. For tunnel IPs, multiple tunnels may share the
@@ -1160,10 +1257,9 @@ type Ref struct {
 // this CIDR was previously sent.  If IsValidRoute() returns false but WasSent is true then we need to withdraw
 // the route.
 func (r RouteInfo) IsValidRoute() bool {
-	return r.Pool.Type != proto.IPPoolType_NONE ||
-		r.Block.NodeName != "" ||
+	return (len(r.Pools) > 0) ||
+		len(r.Blocks) > 0 ||
 		len(r.Host.NodeNames) > 0 ||
-		r.Pool.NATOutgoing ||
 		len(r.Refs) > 0
 }
 
@@ -1174,6 +1270,14 @@ func (r RouteInfo) Copy() RouteInfo {
 	if len(r.Refs) != 0 {
 		cp.Refs = make([]Ref, len(r.Refs))
 		copy(cp.Refs, r.Refs)
+	}
+	if len(r.Pools) != 0 {
+		cp.Pools = make([]Pool, len(r.Pools))
+		copy(cp.Pools, r.Pools)
+	}
+	if len(r.Blocks) != 0 {
+		cp.Blocks = make([]Block, len(r.Blocks))
+		copy(cp.Blocks, r.Blocks)
 	}
 	return cp
 }

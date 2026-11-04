@@ -12,24 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
+	"context"
 	"os"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	api "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 
-	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
-
-	"context"
-
 	"github.com/projectcalico/calico/felix/fv/infrastructure"
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
-
+	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
 	options2 "github.com/projectcalico/calico/libcalico-go/lib/options"
 )
 
@@ -45,8 +40,7 @@ var _ = infrastructure.DatastoreDescribe(
 
 		var (
 			infra        infrastructure.DatastoreInfra
-			felixes      []*infrastructure.Felix
-			felix        *infrastructure.Felix
+			tc           infrastructure.TopologyContainers
 			options      infrastructure.TopologyOptions
 			calicoClient client.Interface
 		)
@@ -57,26 +51,18 @@ var _ = infrastructure.DatastoreDescribe(
 		})
 
 		JustBeforeEach(func() {
-			felixes, calicoClient = infrastructure.StartNNodeTopology(1, options, infra)
-			felix = felixes[0]
-		})
-
-		AfterEach(func() {
-			for _, f := range felixes {
-				f.Stop()
-			}
-			infra.Stop()
+			tc, calicoClient = infrastructure.StartNNodeTopology(1, options, infra)
 		})
 
 		Context("With Felix configuration set GRO disabled on eth0", func() {
 			It("should detected by the ethtool in Felix to assert update made successfully ", func() {
 
 				// Ensure Generic Receive Offload [GRO] enabled by default.
-				err := felix.ExecMayFail("ethtool", "-K", "eth0", "gro", "on")
+				err := tc.Felixes[0].ExecMayFail("ethtool", "-K", "eth0", "gro", "on")
 				Expect(err).NotTo(HaveOccurred())
 
 				Eventually(func() string {
-					out, _ := felix.ExecOutput("ethtool", "-k", "eth0")
+					out, _ := tc.Felixes[0].ExecOutput("ethtool", "-k", "eth0")
 					return out
 				}, "15s", "1s").Should(ContainSubstring("generic-receive-offload: on"))
 
@@ -90,9 +76,9 @@ var _ = infrastructure.DatastoreDescribe(
 				Expect(err).NotTo(HaveOccurred())
 
 				// Restart Felix and assert GRO disabled on eth0 accordingly.
-				felix.Restart()
+				tc.Felixes[0].Restart()
 				Eventually(func() string {
-					out, _ := felix.ExecOutput("ethtool", "-k", "eth0")
+					out, _ := tc.Felixes[0].ExecOutput("ethtool", "-k", "eth0")
 					return out
 				}, "15s", "1s").Should(ContainSubstring("generic-receive-offload: off"))
 			})

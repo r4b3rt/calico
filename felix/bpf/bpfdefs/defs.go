@@ -14,10 +14,23 @@
 
 package bpfdefs
 
+import "os"
+
 const (
-	DefaultBPFfsPath = "/sys/fs/bpf"
-	CgroupV2Path     = "/run/calico/cgroup"
+	DefaultBPFfsPath    = "/sys/fs/bpf"
+	DefaultCgroupV2Path = "/run/calico/cgroup"
 
 	GlobalPinDir = DefaultBPFfsPath + "/tc/globals/"
 	ObjectDir    = "/usr/lib/calico/bpf"
+	CtlbPinDir   = "ctlb"
+	TcxPinDir    = DefaultBPFfsPath + "/tcx"
+	NetkitPinDir = DefaultBPFfsPath + "/netkit"
 )
+
+func GetCgroupV2Path() string {
+	cgroupV2CustomPath := os.Getenv("CALICO_CGROUP_PATH")
+	if cgroupV2CustomPath == "" {
+		return DefaultCgroupV2Path
+	}
+	return cgroupV2CustomPath
+}

@@ -15,12 +15,11 @@
 package iptables_test
 
 import (
-	. "github.com/projectcalico/calico/felix/iptables"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/projectcalico/calico/felix/generictables"
+	. "github.com/projectcalico/calico/felix/iptables"
 	"github.com/projectcalico/calico/felix/proto"
 )
 
@@ -45,10 +44,20 @@ var _ = Describe("MatchBuilder failure cases", func() {
 			Match().MarkMatchesWithMask(0x0, 0x0)
 		}).To(Panic())
 	})
+	It("should panic if ConnMarkMatchesWithMask is passed an invalid mark", func() {
+		Expect(func() {
+			Match().ConnMarkMatchesWithMask(0xf, 0x1)
+		}).To(Panic())
+	})
+	It("should panic if ConnMarkMatchesWithMask is passed a 0 mask", func() {
+		Expect(func() {
+			Match().ConnMarkMatchesWithMask(0x0, 0x0)
+		}).To(Panic())
+	})
 })
 
 var _ = DescribeTable("MatchBuilder",
-	func(match MatchCriteria, expRendering string) {
+	func(match generictables.MatchCriteria, expRendering string) {
 		Expect(match.Render()).To(Equal(expRendering))
 	},
 	// Marks.
@@ -57,17 +66,20 @@ var _ = DescribeTable("MatchBuilder",
 	Entry("MarkSingleBitSet", Match().MarkSingleBitSet(0x4000), "-m mark --mark 0x4000/0x4000"),
 	Entry("MarkMatchesWithMask", Match().MarkMatchesWithMask(0x400a, 0xf00f), "-m mark --mark 0x400a/0xf00f"),
 	Entry("NotMarkMatchesWithMask", Match().NotMarkMatchesWithMask(0x400a, 0xf00f), "-m mark ! --mark 0x400a/0xf00f"),
+	Entry("ConnMarkMatchesWithMask", Match().ConnMarkMatchesWithMask(0x400a, 0xf00f), "-m connmark --mark 0x400a/0xf00f"),
 	// Conntrack.
 	Entry("ConntrackState", Match().ConntrackState("INVALID"), "-m conntrack --ctstate INVALID"),
+	// TCP flags.
+	Entry("TCPFlagsSet", Match().TCPFlagsSet("RST"), "-p tcp -m tcp --tcp-flags RST RST"),
 	// Interfaces.
 	Entry("InInterface", Match().InInterface("tap1234abcd"), "--in-interface tap1234abcd"),
 	Entry("OutInterface", Match().OutInterface("tap1234abcd"), "--out-interface tap1234abcd"),
 	// Address types.
-	Entry("SrcAddrType limit iface", Match().SrcAddrType(AddrTypeLocal, true), "-m addrtype --src-type LOCAL --limit-iface-out"),
-	Entry("SrcAddrType no limit iface", Match().SrcAddrType(AddrTypeLocal, false), "-m addrtype --src-type LOCAL"),
-	Entry("NotSrcAddrType limit iface", Match().NotSrcAddrType(AddrTypeLocal, true), "-m addrtype ! --src-type LOCAL --limit-iface-out"),
-	Entry("NotSrcAddrType no limit iface", Match().NotSrcAddrType(AddrTypeLocal, false), "-m addrtype ! --src-type LOCAL"),
-	Entry("DestAddrType no limit iface", Match().DestAddrType(AddrTypeLocal), "-m addrtype --dst-type LOCAL"),
+	Entry("SrcAddrType limit iface", Match().SrcAddrType(generictables.AddrTypeLocal, true), "-m addrtype --src-type LOCAL --limit-iface-out"),
+	Entry("SrcAddrType no limit iface", Match().SrcAddrType(generictables.AddrTypeLocal, false), "-m addrtype --src-type LOCAL"),
+	Entry("NotSrcAddrType limit iface", Match().NotSrcAddrType(generictables.AddrTypeLocal, true), "-m addrtype ! --src-type LOCAL --limit-iface-out"),
+	Entry("NotSrcAddrType no limit iface", Match().NotSrcAddrType(generictables.AddrTypeLocal, false), "-m addrtype ! --src-type LOCAL"),
+	Entry("DestAddrType no limit iface", Match().DestAddrType(generictables.AddrTypeLocal), "-m addrtype --dst-type LOCAL"),
 	// Protocol.
 	Entry("Protocol", Match().Protocol("tcp"), "-p tcp"),
 	Entry("NotProtocol", Match().NotProtocol("tcp"), "! -p tcp"),
@@ -112,4 +124,7 @@ var _ = DescribeTable("MatchBuilder",
 	// IPVS.
 	Entry("IPVSConnection", Match().IPVSConnection(), "-m ipvs --ipvs"),
 	Entry("NotIPVSConnection", Match().NotIPVSConnection(), "-m ipvs ! --ipvs"),
+	// Limits.
+	Entry("Limit with rate", Match().Limit("30/second", 0), "-m limit --limit 30/second"),
+	Entry("Limit with rate and burst", Match().Limit("40/day", 5), "-m limit --limit 40/day --limit-burst 5"),
 )

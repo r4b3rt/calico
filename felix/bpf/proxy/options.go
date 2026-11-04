@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,12 @@
 package proxy
 
 import (
+	"fmt"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+
+	"github.com/projectcalico/calico/felix/ip"
 )
 
 // Option defines Proxy options
@@ -55,6 +58,14 @@ func WithMinSyncPeriod(min time.Duration) Option {
 	})
 }
 
+func WithMaxSyncPeriod(max time.Duration) Option {
+	return makeOption(func(p *proxy) error {
+		p.maxDPSyncPeriod = max
+		log.Infof("proxy.WithMaxSyncPeriod(%s)", max)
+		return nil
+	})
+}
+
 // WithImmediateSync triggers sync with dataplane on immediately on every update
 func WithImmediateSync() Option {
 	return WithMinSyncPeriod(0)
@@ -72,6 +83,72 @@ func WithDSREnabled() Option {
 func WithTopologyNodeZone(nodeZone string) Option {
 	return makeOption(func(p *proxy) error {
 		p.nodeZone = nodeZone
+		return nil
+	})
+}
+
+func WithIPFamily(ipFamily int) Option {
+	return func(p Proxy) error {
+		p.setIpFamily(ipFamily)
+		return nil
+	}
+}
+
+func WithMaglevLUTSize(size int) Option {
+	return func(P Proxy) error {
+		p, ok := P.(*KubeProxy)
+		if !ok {
+			return nil
+		}
+
+		p.maglevLUTSize = size
+		return nil
+	}
+}
+
+var excludeCIDRsMatch = 1
+
+func WithExcludedCIDRs(cidrs []string) Option {
+	return makeKubeProxyOption(func(kp *KubeProxy) error {
+		if kp.ipFamily == 0 {
+			return fmt.Errorf("ip family is not set")
+		}
+
+		kp.excludedCIDRs = ip.NewCIDRTrie()
+
+		for _, c := range cidrs {
+			cidr, err := ip.CIDRFromString(c)
+			if err != nil {
+				return fmt.Errorf("bad CIDR %s: %w", c, err)
+			}
+
+			if int(cidr.Version()) != kp.ipFamily {
+				continue
+			}
+
+			kp.excludedCIDRs.Update(cidr, &excludeCIDRsMatch)
+		}
+
+		return nil
+	})
+}
+
+// WithCTLBUDPAffinityTimeout tells the syncer how long the connect-time load
+// balancer keeps its affinity entries for unconnected UDP sockets alive, so that
+// the syncer's affinity map cleanup does not delete entries that the CTLB still
+// considers valid. Pass 0 when the CTLB does not handle UDP.
+func WithCTLBUDPAffinityTimeout(timeo time.Duration) Option {
+	return makeKubeProxyOption(func(kp *KubeProxy) error {
+		kp.ctlbUDPAffinityTimeo = timeo
+		return nil
+	})
+}
+
+func WithHealthCheck(hc Healthcheck) Option {
+	return makeOption(func(p *proxy) error {
+		if hc != nil {
+			p.healthzServer = hc
+		}
 		return nil
 	})
 }

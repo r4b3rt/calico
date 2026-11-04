@@ -28,6 +28,7 @@ import (
 
 	"github.com/projectcalico/calico/felix/bpf/bpfmap"
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
+	"github.com/projectcalico/calico/felix/bpf/failsafes"
 	bpfmaps "github.com/projectcalico/calico/felix/bpf/maps"
 )
 
@@ -55,20 +56,18 @@ func TestMapResize(t *testing.T) {
 	conntrack.SetMapSize(600)
 	defer bpfmaps.ResetSizes()
 
-	bpfmaps.EnableRepin()
-	defer bpfmaps.DisableRepin()
-
-	maps, err := bpfmap.CreateBPFMaps()
+	maps, err := bpfmap.CreateBPFMaps(false)
 	Expect(err).NotTo(HaveOccurred())
+
 	defer restoreMaps(maps)
 	// New CT map should have max_entries as 600
-	ctMapInfo, err := bpfmaps.GetMapInfo(maps.CtMap.MapFD())
+	ctMapInfo, err := bpfmaps.GetMapInfo(maps.V4.CtMap.MapFD())
 	Expect(err).NotTo(HaveOccurred(), "Failed to get ct map info")
 	Expect(ctMapInfo.MaxEntries).To(Equal(600))
 	// Except CT map, other map's old pins should be deleted.
-	_, err = os.Stat(maps.RouteMap.Path() + "_old")
+	_, err = os.Stat(maps.V4.RouteMap.Path() + "_old")
 	Expect(err).To(HaveOccurred(), "old route map present")
-	_, err = os.Stat(maps.CtMap.Path() + "_old")
+	_, err = os.Stat(maps.V4.CtMap.Path() + "_old")
 	Expect(err).NotTo(HaveOccurred(), "old ct map not present")
 }
 
@@ -79,17 +78,18 @@ func TestMapResizeWithCopy(t *testing.T) {
 
 	// Resize the CT map to 600. New map should have the entry in the old map
 	conntrack.SetMapSize(600)
-	maps, err := bpfmap.CreateBPFMaps()
+	maps, err := bpfmap.CreateBPFMaps(false)
 	Expect(err).NotTo(HaveOccurred())
+
 	defer restoreMaps(maps)
-	val, err := maps.CtMap.Get(k.AsBytes())
+	val, err := maps.V4.CtMap.Get(k.AsBytes())
 	Expect(err).NotTo(HaveOccurred(), "ct entry not present in the new map")
 	v := conntrack.Value{}
 	for i := range v {
 		v[i] = uint8(i)
 	}
 	Expect(v.AsBytes()).To(Equal(val))
-	err = maps.CtMap.CopyDeltaFromOldMap()
+	err = maps.V4.CtMap.CopyDeltaFromOldMap()
 	Expect(err).NotTo(HaveOccurred(), "migration failed")
 }
 
@@ -97,7 +97,7 @@ func TestMapDownSize(t *testing.T) {
 	RegisterTestingT(t)
 	// Add 10 entries to the old map
 	numEntries := 10
-	for i := 0; i < numEntries; i++ {
+	for i := range numEntries {
 		err := insertNumberedKey(i)
 		Expect(err).NotTo(HaveOccurred())
 	}
@@ -107,10 +107,51 @@ func TestMapDownSize(t *testing.T) {
 
 	// New map creation should panic as the number of entries in old map is more than what the new map can
 	// accommodate
-	maps, err := bpfmap.CreateBPFMaps()
+	maps, err := bpfmap.CreateBPFMaps(false)
 	defer restoreMaps(maps)
 	expectedError := fmt.Sprintf("failed to create %s map, err=new map cannot hold all the data from the old map %s", ctMap.GetName(), ctMap.GetName())
 	Expect(err.Error()).To(Equal(expectedError))
+}
+
+func TestKeepPinnedSizes(t *testing.T) {
+	t.Run("pinned", func(t *testing.T) {
+		testKeepPinnedSizes(t, func() {
+			Expect(os.Remove(ctMap.Path() + "_old")).To(Succeed())
+		})
+	})
+	t.Run("pinned at _old", func(t *testing.T) {
+		// Felix died after repinning the live map to _old, before creating the new one.
+		testKeepPinnedSizes(t, func() {
+			Expect(os.Remove(ctMap.Path() + "_old")).To(Succeed())
+			Expect(os.Rename(ctMap.Path(), ctMap.Path()+"_old")).To(Succeed())
+		})
+	})
+}
+
+func testKeepPinnedSizes(t *testing.T, arrangePins func()) {
+	k, err := setUpMapTestWithSingleKV(t)
+	Expect(err).NotTo(HaveOccurred(), "Failed to create ct entry")
+
+	conntrack.SetMapSize(600)
+	defer bpfmaps.ResetSizes()
+	maps, err := bpfmap.CreateBPFMaps(false)
+	Expect(err).NotTo(HaveOccurred())
+	maps.Close()
+	arrangePins()
+
+	// A process without Felix's config sees only the default sizes.
+	bpfmaps.ResetSizes()
+	maps, err = bpfmap.CreateBPFMapsKeepingPinnedSizes(false)
+	Expect(err).NotTo(HaveOccurred())
+	defer restoreMaps(maps)
+
+	ctMapInfo, err := bpfmaps.GetMapInfo(maps.V4.CtMap.MapFD())
+	Expect(err).NotTo(HaveOccurred(), "Failed to get ct map info")
+	Expect(ctMapInfo.MaxEntries).To(Equal(600))
+	_, err = os.Stat(ctMap.Path() + "_old")
+	Expect(os.IsNotExist(err)).To(BeTrue(), "ct map was migrated")
+	_, err = maps.V4.CtMap.Get(k.AsBytes())
+	Expect(err).NotTo(HaveOccurred(), "ct entry lost")
 }
 
 func TestCTDeltaMigration(t *testing.T) {
@@ -121,7 +162,7 @@ func TestCTDeltaMigration(t *testing.T) {
 	// Resize the ctmap
 	conntrack.SetMapSize(666)
 
-	maps, err := bpfmap.CreateBPFMaps()
+	maps, err := bpfmap.CreateBPFMaps(false)
 	Expect(err).NotTo(HaveOccurred())
 
 	defer restoreMaps(maps)
@@ -131,7 +172,7 @@ func TestCTDeltaMigration(t *testing.T) {
 	}
 
 	// Total number of k,v in old map should be 1
-	ctSaved := saveCTMap(maps.CtMap)
+	ctSaved := saveCTMap(maps.V4.CtMap)
 	Expect(ctSaved).To(HaveLen(1))
 	Expect(ctSaved).Should(HaveKeyWithValue(k, v))
 
@@ -150,7 +191,7 @@ func TestCTDeltaMigration(t *testing.T) {
 
 	// Add 10 more entries to the old map
 	numEntries := 10
-	for i := 0; i < numEntries; i++ {
+	for i := range numEntries {
 		err := insertNumberedKey(i)
 		Expect(err).NotTo(HaveOccurred())
 	}
@@ -158,7 +199,7 @@ func TestCTDeltaMigration(t *testing.T) {
 	matchKeyVals := func(ctSaved conntrack.MapMem) {
 		Expect(ctSaved).Should(HaveKeyWithValue(k, newVal))
 		Expect(ctSaved).ShouldNot(HaveKeyWithValue(k, v))
-		for i := 0; i < numEntries; i++ {
+		for i := range numEntries {
 			key := conntrack.NewKey(1, net.ParseIP("10.0.0.1"), uint16(i), net.ParseIP("10.0.0.2"), uint16(i>>16))
 			val := conntrack.Value{}
 			for j := range val {
@@ -170,18 +211,67 @@ func TestCTDeltaMigration(t *testing.T) {
 
 	t.Log("STEP: copy delta")
 
-	_, err = os.Stat(maps.CtMap.Path() + "_old")
+	_, err = os.Stat(maps.V4.CtMap.Path() + "_old")
 	Expect(err).NotTo(HaveOccurred(), "old conntrack map present")
 	// Migrate the delta (10 k,v pairs) to the new map
-	err = maps.CtMap.CopyDeltaFromOldMap()
+	err = maps.V4.CtMap.CopyDeltaFromOldMap()
 	Expect(err).NotTo(HaveOccurred(), "migration failed")
-	ctSaved = saveCTMap(maps.CtMap)
+	ctSaved = saveCTMap(maps.V4.CtMap)
 	Expect(ctSaved).To(HaveLen(numEntries + 1))
 	matchKeyVals(ctSaved)
 
 	Expect(err).NotTo(HaveOccurred())
-	_, err = os.Stat(maps.CtMap.Path() + "_old")
+	_, err = os.Stat(maps.V4.CtMap.Path() + "_old")
 	Expect(err).To(HaveOccurred(), "old conntrack map present")
+}
+
+// Copies span several write batches plus a partial one, in both the resize and the delta pass.
+func TestCTMigrationManyEntries(t *testing.T) {
+	RegisterTestingT(t)
+	fallbacks := bpfmaps.CopyFallbacks()
+	testCTMigrationManyEntries(t)
+	Expect(bpfmaps.CopyFallbacks()).To(Equal(fallbacks), "batched copy fell back to per-entry updates")
+}
+
+func TestCTMigrationBatchFallback(t *testing.T) {
+	RegisterTestingT(t)
+	bpfmaps.SetCopyBatchFailForTesting(true)
+	defer bpfmaps.SetCopyBatchFailForTesting(false)
+	fallbacks := bpfmaps.CopyFallbacks()
+	testCTMigrationManyEntries(t)
+	// Initial copy: batches of 1000, 1000, 500; delta copy: 1000, 500.
+	Expect(bpfmaps.CopyFallbacks() - fallbacks).To(BeNumerically("==", 5))
+}
+
+// testCTMigrationManyEntries uses counts that are not batch multiples, so the final flushes are partial.
+func testCTMigrationManyEntries(t *testing.T) {
+	const numEntries = 2500
+	for i := range numEntries {
+		Expect(insertNumberedKey(i)).To(Succeed())
+	}
+
+	conntrack.SetMapSize(2 * numEntries)
+	maps, err := bpfmap.CreateBPFMaps(false)
+	Expect(err).NotTo(HaveOccurred())
+	defer restoreMaps(maps)
+	Expect(saveCTMap(maps.V4.CtMap)).To(HaveLen(numEntries))
+
+	t.Log("STEP: add entries to the old map, then copy the delta")
+	for i := numEntries; i < numEntries+1500; i++ {
+		Expect(insertNumberedKey(i)).To(Succeed())
+	}
+	Expect(maps.V4.CtMap.CopyDeltaFromOldMap()).To(Succeed())
+
+	ctSaved := saveCTMap(maps.V4.CtMap)
+	Expect(ctSaved).To(HaveLen(numEntries + 1500))
+	for i := range numEntries + 1500 {
+		key := conntrack.NewKey(1, net.ParseIP("10.0.0.1"), uint16(i), net.ParseIP("10.0.0.2"), uint16(i>>16))
+		val := conntrack.Value{}
+		for j := range val {
+			val[j] = uint8(j + i)
+		}
+		Expect(ctSaved).To(HaveKeyWithValue(key, val))
+	}
 }
 
 func TestMapEntryDeletion(t *testing.T) {
@@ -193,7 +283,7 @@ func TestMapEntryDeletion(t *testing.T) {
 	// Defer error checking since the Delete calls do the cleanup for this test...
 	Expect(err1).NotTo(HaveOccurred(), "Failed to create map entry")
 	Expect(err2).NotTo(HaveOccurred(), "Failed to delete map entry")
-	Expect(bpfmaps.IsNotExists(err3)).To(Equal(true), "Error from deletion of non-existent entry was incorrect")
+	Expect(bpfmaps.IsNotExists(err3)).To(Equal(true), "Error from deletion of nonexistent entry was incorrect")
 }
 
 func TestMapIterActionDelete(t *testing.T) {
@@ -265,12 +355,12 @@ func TestDeleteDuringIter(t *testing.T) {
 
 func testDelDuringIterN(numEntries int) {
 	cleanUpMaps()
-	for i := 0; i < numEntries; i++ {
+	for i := range numEntries {
 		err := insertNumberedKey(i)
 		Expect(err).NotTo(HaveOccurred())
 	}
 	// First pass, no deletions.
-	seenKeys := map[conntrack.Key]bool{}
+	seenKeys := map[conntrack.KeyInterface]bool{}
 	err := ctMap.Iter(func(k, v []byte) bpfmaps.IteratorAction {
 		key := conntrack.KeyFromBytes(k)
 		Expect(seenKeys[key]).To(BeFalse(), "Saw a duplicate key")
@@ -281,9 +371,9 @@ func testDelDuringIterN(numEntries int) {
 	Expect(seenKeys).To(HaveLen(numEntries), "Should have seen expected num entries on first iteration")
 
 	// Second pass, delete alternate keys.
-	seenKeys = map[conntrack.Key]bool{}
+	seenKeys = map[conntrack.KeyInterface]bool{}
 	deleteNextKey := false
-	expectedKeys := map[conntrack.Key]bool{}
+	expectedKeys := map[conntrack.KeyInterface]bool{}
 	err = ctMap.Iter(func(k, v []byte) bpfmaps.IteratorAction {
 		defer func() {
 			deleteNextKey = !deleteNextKey
@@ -303,7 +393,7 @@ func testDelDuringIterN(numEntries int) {
 
 	// Third pass, insert key on each iteration an delete on alternate iterations.
 	numLeftAfterSecondPass := len(expectedKeys)
-	seenKeys = map[conntrack.Key]bool{}
+	seenKeys = map[conntrack.KeyInterface]bool{}
 	deleteNextKey = false
 	insertClock := 0
 	insertIdx := numEntries
@@ -395,7 +485,7 @@ func benchMapIteration(b *testing.B, n int) {
 
 func setUpConntrackMapEntries(b *testing.B, n int) {
 	b.StopTimer()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		var k conntrack.Key
 		var v conntrack.Value
 		binary.LittleEndian.PutUint32(k[:], uint32(i))
@@ -405,6 +495,22 @@ func setUpConntrackMapEntries(b *testing.B, n int) {
 		}
 	}
 	b.StartTimer()
+}
+
+func BenchmarkCTMapResizeCopy400k(b *testing.B) {
+	RegisterTestingT(b)
+	logLevel := logrus.GetLevel()
+	logrus.SetLevel(logrus.InfoLevel)
+	defer logrus.SetLevel(logLevel)
+	for range b.N {
+		setUpConntrackMapEntries(b, 400000)
+		conntrack.SetMapSize(800000)
+		b.StartTimer()
+		maps, err := bpfmap.CreateBPFMaps(false)
+		b.StopTimer()
+		Expect(err).NotTo(HaveOccurred())
+		restoreMaps(maps)
+	}
 }
 
 func BenchmarkMapIteratorMulti10(b *testing.B) {
@@ -446,7 +552,7 @@ func benchMapIteratorMulti(b *testing.B, n int) {
 }
 
 func doSingleMapIteratorMultiTest(n int) {
-	iter, err := bpfmaps.NewIterator(ctMap.MapFD(), conntrack.KeySize, conntrack.ValueSize, conntrack.MaxEntries)
+	iter, err := bpfmaps.NewIterator(ctMap.MapFD(), conntrack.KeySize, conntrack.ValueSize, conntrack.MaxEntries, true)
 	if err != nil {
 		panic(err)
 	}
@@ -469,4 +575,38 @@ func doSingleMapIteratorMultiTest(n int) {
 	_ = iter.Close()
 	runtime.KeepAlive(k)
 	runtime.KeepAlive(v)
+}
+
+// Test slow iteration of failsafe map.
+func TestFailsafeMapIteration(t *testing.T) {
+	RegisterTestingT(t)
+	defer cleanUpMaps()
+	port := []uint16{8080, 8081, 8082, 8083, 8084}
+	keys := make([]failsafes.Key, 0, len(port))
+	for _, p := range port {
+		k := failsafes.MakeKey(17, p, false, "0.0.0.0", 32)
+		err := fsafeMap.Update(k.ToSlice(), []byte{1, 2, 3, 4})
+		Expect(err).NotTo(HaveOccurred())
+		keys = append(keys, k.(failsafes.Key))
+	}
+
+	iter, err := bpfmaps.NewIterator(fsafeMap.MapFD(), failsafes.KeySize, failsafes.ValueSize, failsafes.MapParams.MaxEntries, false)
+	Expect(err).NotTo(HaveOccurred())
+	var k []byte
+	numIterations := 0
+	for {
+		k, _, err = iter.Next()
+		if err != nil {
+			if err == bpfmaps.ErrIterationFinished {
+				break
+			}
+			Expect(err).NotTo(HaveOccurred())
+		}
+		numIterations++
+		key := failsafes.KeyFromSlice(k)
+		Expect(keys).To(ContainElement(key.(failsafes.Key)), "Unexpected key found during iteration")
+	}
+
+	Expect(numIterations).To(Equal(len(port)))
+	_ = iter.Close()
 }

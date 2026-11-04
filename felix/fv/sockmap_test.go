@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build fvtests
-
 package fv_test
 
 import (
@@ -27,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 
@@ -85,7 +83,7 @@ func testIPToHex(ip string) []string {
 }
 
 func getEndpointsMapContents(felix *infrastructure.Felix) [][]string {
-	output, err := felix.Container.ExecOutput(
+	output, err := felix.ExecOutput(
 		"bpftool",
 		"--json",
 		"--pretty",
@@ -163,7 +161,7 @@ func lockSockmapTest() {
 		"dir":      dir,
 		"lockfile": n,
 	}).Info("About to lock")
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.WithFields(log.Fields{
 			"dir":      dir,
 			"lockfile": n,
@@ -175,7 +173,7 @@ func lockSockmapTest() {
 		"lockfile": n,
 	}).Info("Dir for lock is there")
 	for {
-		f, err := os.OpenFile(n, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0640)
+		f, err := os.OpenFile(n, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o640)
 		if err == nil {
 			log.WithFields(log.Fields{
 				"dir":      dir,
@@ -217,7 +215,7 @@ func unlockSockmapTest() {
 var _ = infrastructure.DatastoreDescribe("[SOCKMAP] with Felix using sockmap", []apiconfig.DatastoreType{apiconfig.EtcdV3 /*, apiconfig.Kubernetes*/}, func(getInfra infrastructure.InfraFactory) {
 	var (
 		infra   infrastructure.DatastoreInfra
-		felix   *infrastructure.Felix
+		tc      infrastructure.TopologyContainers
 		host    *workload.Workload
 		ip      string
 		port    int
@@ -243,12 +241,12 @@ var _ = infrastructure.DatastoreDescribe("[SOCKMAP] with Felix using sockmap", [
 		}()
 		infra = getInfra()
 		opts := getSockmapOpts()
-		felix, _ = infrastructure.StartSingleNodeTopology(opts, infra)
+		tc, _ = infrastructure.StartSingleNodeTopology(opts, infra)
 		ip = "10.65.0.2"
 		port = 8055
 		srcPort = 8056
 		host = workload.Run(
-			felix,
+			tc.Felixes[0],
 			"service",
 			"default",
 			ip,
@@ -261,7 +259,7 @@ var _ = infrastructure.DatastoreDescribe("[SOCKMAP] with Felix using sockmap", [
 	AfterEach(func() {
 		defer unlockSockmapTest()
 		host.Stop()
-		felix.Stop()
+
 		// Clean up the sockmap state. We do this by starting
 		// a new felix instance (after stopping the old one),
 		// so it cleans up the whatever state we ended up
@@ -273,9 +271,9 @@ var _ = infrastructure.DatastoreDescribe("[SOCKMAP] with Felix using sockmap", [
 		// them. That way we will have no leftovers.
 		func() {
 			opts := getSockmapOpts()
-			felix, _ = infrastructure.StartSingleNodeTopology(opts, infra)
-			defer felix.Stop()
-			output, err := felix.Container.ExecOutput(
+			tc, _ = infrastructure.StartSingleNodeTopology(opts, infra)
+			defer tc.Stop()
+			output, err := tc.Felixes[0].ExecOutput(
 				"bpftool",
 				"--json",
 				"--pretty",
@@ -286,20 +284,20 @@ var _ = infrastructure.DatastoreDescribe("[SOCKMAP] with Felix using sockmap", [
 			)
 			if err != nil {
 				log.WithFields(log.Fields{
-					"containerID": felix.Container.Name,
+					"containerID": tc.Felixes[0].Name,
 					"output":      output,
 				}).WithError(err).Info("Failed to dump the contents of the sock map, skipping cleanup")
 				return
 			}
 			if strings.TrimSpace(output) != "[]" {
 				log.WithFields(log.Fields{
-					"containerID": felix.Container.Name,
+					"containerID": tc.Felixes[0].Name,
 					"output":      output,
 				}).Info("Sock map is not empty, skipping cleanup")
 				return
 			}
 			fullCgroupDir := "/run/calico/cgroup"
-			output, err = felix.Container.ExecOutput(
+			output, err = tc.Felixes[0].ExecOutput(
 				"bpftool",
 				"cgroup",
 				"detach",
@@ -311,14 +309,13 @@ var _ = infrastructure.DatastoreDescribe("[SOCKMAP] with Felix using sockmap", [
 			if err != nil {
 				log.WithFields(log.Fields{
 					"cgroupdir":   fullCgroupDir,
-					"containerID": felix.Container.Name,
+					"containerID": tc.Felixes[0].Name,
 					"output":      output,
 				}).WithError(err).Info("Failed to detach sockops program from cgroup, skipping cleanup")
 				return
 			}
 			log.Info("Cleanup finished")
 		}()
-		infra.Stop()
 	})
 
 	It("should put the IP of the host in sockmap endpoints map", func() {
@@ -328,7 +325,7 @@ var _ = infrastructure.DatastoreDescribe("[SOCKMAP] with Felix using sockmap", [
 			"hexen": hexen,
 		}).Info("Looking for IP.")
 		Eventually(func() [][]string {
-			return getEndpointsMapContents(felix)
+			return getEndpointsMapContents(tc.Felixes[0])
 		}, 5*time.Second, 500*time.Millisecond).Should(ContainElement(hexen))
 	})
 
@@ -343,7 +340,7 @@ var _ = infrastructure.DatastoreDescribe("[SOCKMAP] with Felix using sockmap", [
 		{
 			hexen := testIPToHex(ip)
 			Eventually(func() [][]string {
-				return getEndpointsMapContents(felix)
+				return getEndpointsMapContents(tc.Felixes[0])
 			}, 5*time.Second, 500*time.Millisecond).Should(ContainElement(hexen))
 		}
 		side := host.StartSideService()
@@ -354,7 +351,7 @@ var _ = infrastructure.DatastoreDescribe("[SOCKMAP] with Felix using sockmap", [
 		defer pc.Stop()
 		expectedKeys := getExpectedSockmapKeys(ip, srcPort)
 		Eventually(func() [][]string {
-			output, err := felix.Container.ExecOutput(
+			output, err := tc.Felixes[0].Container.ExecOutput(
 				"bpftool",
 				"map",
 				"dump",

@@ -21,12 +21,13 @@ import (
 	"sync"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/felix/jitter"
 	"github.com/projectcalico/calico/felix/proto"
+	"github.com/projectcalico/calico/felix/types"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	calierrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 )
@@ -71,24 +72,30 @@ var hostEPDown = model.HostEndpointStatus{
 	Status: "down",
 }
 
-var protoWlID = proto.WorkloadEndpointID{
+var hostEPUp = model.HostEndpointStatus{
+	Status: "up",
+}
+
+var wlID = types.WorkloadEndpointID{
 	OrchestratorId: "orch",
 	WorkloadId:     "updatedWL",
 	EndpointId:     "updatedEP",
 }
 
+var protoWlID = types.WorkloadEndpointIDToProto(wlID)
+
 var protoUp = proto.EndpointStatus{Status: "up"}
 var protoDown = proto.EndpointStatus{Status: "down"}
 
 var wlEPUpdateUp = proto.WorkloadEndpointStatusUpdate{
-	Id:     &protoWlID,
+	Id:     protoWlID,
 	Status: &protoUp,
 }
 var wlEPRemove = proto.WorkloadEndpointStatusRemove{
-	Id: &protoWlID,
+	Id: protoWlID,
 }
 var wlEPUpdateDown = proto.WorkloadEndpointStatusUpdate{
-	Id:     &protoWlID,
+	Id:     protoWlID,
 	Status: &protoDown,
 }
 var updatedWlEPKey = model.WorkloadEndpointStatusKey{
@@ -106,18 +113,21 @@ var updatedWlEPKeyRegion = model.WorkloadEndpointStatusKey{
 	RegionString:   "region-Europe",
 }
 
-var protoHostID = proto.HostEndpointID{
+var hostID = types.HostEndpointID{
 	EndpointId: "updatedEP",
 }
+
+var protoHostID = types.HostEndpointIDToProto(hostID)
+
 var hostEPUpdateUp = proto.HostEndpointStatusUpdate{
-	Id:     &protoHostID,
+	Id:     protoHostID,
 	Status: &protoUp,
 }
 var hostEPRemove = proto.HostEndpointStatusRemove{
-	Id: &protoHostID,
+	Id: protoHostID,
 }
 var hostEPUpdateDown = proto.HostEndpointStatusUpdate{
-	Id:     &protoHostID,
+	Id:     protoHostID,
 	Status: &protoDown,
 }
 var updatedHostEPKey = model.HostEndpointStatusKey{
@@ -127,8 +137,7 @@ var updatedHostEPKey = model.HostEndpointStatusKey{
 
 var _ = Describe("Status", func() {
 	var esr *EndpointStatusReporter
-	var epUpdates chan interface{}
-	var inSyncChan chan bool
+	var epUpdates chan any
 	var datastore *mockDatastore
 	var resyncTicker, rateLimitTicker *mockStoppable
 	var resyncTickerChan, rateLimitTickerChan chan time.Time
@@ -141,8 +150,7 @@ var _ = Describe("Status", func() {
 
 	JustBeforeEach(func() {
 		log.Info("JustBeforeEach called, creating EndpointStatusReporter")
-		epUpdates = make(chan interface{})
-		inSyncChan = make(chan bool)
+		epUpdates = make(chan any)
 		datastore = newMockDatastore()
 		resyncTicker = &mockStoppable{}
 		rateLimitTicker = &mockStoppable{}
@@ -153,7 +161,6 @@ var _ = Describe("Status", func() {
 			hostname,
 			region,
 			epUpdates,
-			inSyncChan,
 			datastore,
 			resyncTicker,
 			resyncTickerChan,
@@ -174,7 +181,7 @@ var _ = Describe("Status", func() {
 	Describe("with empty datastore", func() {
 		Describe("after sending in-sync message", func() {
 			JustBeforeEach(func() {
-				inSyncChan <- true
+				epUpdates <- &proto.DataplaneInSync{}
 			})
 			It("Should start a resync", func() {
 				resyncTickerChan <- time.Now()
@@ -183,48 +190,76 @@ var _ = Describe("Status", func() {
 					defer datastore.mutex.Unlock()
 					return datastore.workloadsListed
 				}).Should(BeTrue())
-			}, 1)
-			It("should coalesce flapping workload EP updates", func() {
-				epUpdates <- &wlEPUpdateUp
-				epUpdates <- &wlEPUpdateUp
-				epUpdates <- &wlEPUpdateDown
-				epUpdates <- &wlEPUpdateUp
-				epUpdates <- &wlEPUpdateDown
+			})
+			It("should not coalesce flapping workload EP updates", func() {
+				epUpdates <- &wlEPUpdateUp   // tick #1
+				epUpdates <- &wlEPUpdateUp   // no change, ignored
+				epUpdates <- &wlEPUpdateDown // tick #2
+				epUpdates <- &wlEPUpdateUp   // tick #3
+				epUpdates <- &wlEPUpdateDown // tick #4
 				rateLimitTickerChan <- time.Now()
 				rateLimitTickerChan <- time.Now()
-				Eventually(datastore.snapshot).Should(Equal(map[model.Key]interface{}{
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
+					updatedWlEPKey: wlEPDown,
+				}))
+				rateLimitTickerChan <- time.Now()
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
+					updatedWlEPKey: wlEPUp,
+				}))
+				rateLimitTickerChan <- time.Now()
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
 					updatedWlEPKey: wlEPDown,
 				}))
 			})
-			It("should coalesce flapping workload EP create/deletes", func() {
-				epUpdates <- &wlEPUpdateUp
-				epUpdates <- &wlEPUpdateUp
-				epUpdates <- &wlEPRemove
-				epUpdates <- &wlEPUpdateUp
-				epUpdates <- &wlEPRemove
+			It("should not coalesce flapping workload EP create/deletes", func() {
+				epUpdates <- &wlEPUpdateUp // tick #1
+				epUpdates <- &wlEPUpdateUp // no change, ignored
+				epUpdates <- &wlEPRemove   // tick #2
+				epUpdates <- &wlEPUpdateUp // tick #3
+				epUpdates <- &wlEPRemove   // tick #4
 				rateLimitTickerChan <- time.Now()
 				rateLimitTickerChan <- time.Now()
 				Eventually(datastore.snapshot).Should(BeEmpty())
+				rateLimitTickerChan <- time.Now()
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
+					updatedWlEPKey: wlEPUp,
+				}))
+				rateLimitTickerChan <- time.Now()
+				Eventually(datastore.snapshot).Should(BeEmpty())
 			})
-			It("should coalesce flapping host EP updates", func() {
-				epUpdates <- &hostEPUpdateUp
-				epUpdates <- &hostEPUpdateUp
-				epUpdates <- &hostEPUpdateDown
-				epUpdates <- &hostEPUpdateUp
-				epUpdates <- &hostEPUpdateDown
+			It("should not coalesce flapping host EP updates", func() {
+				epUpdates <- &hostEPUpdateUp   // tick #1
+				epUpdates <- &hostEPUpdateUp   // no change, ignored
+				epUpdates <- &hostEPUpdateDown // tick #2
+				epUpdates <- &hostEPUpdateUp   // tick #3
+				epUpdates <- &hostEPUpdateDown // tick #4
 				rateLimitTickerChan <- time.Now()
 				rateLimitTickerChan <- time.Now()
-				Eventually(datastore.snapshot).Should(Equal(map[model.Key]interface{}{
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
+					updatedHostEPKey: hostEPDown,
+				}))
+				rateLimitTickerChan <- time.Now()
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
+					updatedHostEPKey: hostEPUp,
+				}))
+				rateLimitTickerChan <- time.Now()
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
 					updatedHostEPKey: hostEPDown,
 				}))
 			})
-			It("should coalesce flapping host EP create/deletes", func() {
-				epUpdates <- &hostEPUpdateUp
-				epUpdates <- &hostEPUpdateUp
-				epUpdates <- &hostEPRemove
-				epUpdates <- &hostEPUpdateUp
-				epUpdates <- &hostEPRemove
+			It("should not coalesce flapping host EP create/deletes", func() {
+				epUpdates <- &hostEPUpdateUp // tick #1
+				epUpdates <- &hostEPUpdateUp // no change, ignored
+				epUpdates <- &hostEPRemove   // tick #2
+				epUpdates <- &hostEPUpdateUp // tick #3
+				epUpdates <- &hostEPRemove   // tick #4
 				rateLimitTickerChan <- time.Now()
+				rateLimitTickerChan <- time.Now()
+				Eventually(datastore.snapshot).Should(BeEmpty())
+				rateLimitTickerChan <- time.Now()
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
+					updatedHostEPKey: hostEPUp,
+				}))
 				rateLimitTickerChan <- time.Now()
 				Eventually(datastore.snapshot).Should(BeEmpty())
 			})
@@ -238,13 +273,12 @@ var _ = Describe("Status", func() {
 				})
 				It("should retry write", func() {
 					epUpdates <- &wlEPUpdateUp
-					rateLimitTickerChan <- time.Now() // Copies queued to active
 					rateLimitTickerChan <- time.Now() // Tries first write
 					rateLimitTickerChan <- time.Now() // Tries second write
 					time.Sleep(20 * time.Millisecond)
 					Expect(datastore.snapshot()).To(BeEmpty())
 					rateLimitTickerChan <- time.Now() // Triggers successful retry.
-					Eventually(datastore.snapshot).Should(Equal(map[model.Key]interface{}{
+					Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
 						updatedWlEPKey: wlEPUp,
 					}))
 				})
@@ -256,9 +290,8 @@ var _ = Describe("Status", func() {
 				})
 				It("should report status with that region", func() {
 					epUpdates <- &wlEPUpdateUp
-					rateLimitTickerChan <- time.Now() // Copies queued to active
 					rateLimitTickerChan <- time.Now() // Tries first write
-					Eventually(datastore.snapshot).Should(Equal(map[model.Key]interface{}{
+					Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
 						updatedWlEPKeyRegion: wlEPUp,
 					}))
 				})
@@ -274,7 +307,7 @@ var _ = Describe("Status", func() {
 		})
 		Describe("after sending in-sync", func() {
 			JustBeforeEach(func() {
-				inSyncChan <- true
+				epUpdates <- &proto.DataplaneInSync{}
 			})
 			It("should only clean up local endpoints", func() {
 				// Kick off the resync.
@@ -283,26 +316,26 @@ var _ = Describe("Status", func() {
 				rateLimitTickerChan <- time.Now()
 				rateLimitTickerChan <- time.Now()
 				rateLimitTickerChan <- time.Now()
-				Eventually(datastore.snapshot).Should(Equal(map[model.Key]interface{}{
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
 					remoteWlEPKey:   wlEPUp,
 					remoteHostEPKey: hostEPDown,
 				}))
-			}, 1)
+			})
 			It("should clean up one endpoint per tick", func() {
 				// Kick off the resync.
 				resyncTickerChan <- time.Now()
 				// Then send a no-op event (so that we block until
 				// the above event finishes).  No cleanup should happen yet.
-				inSyncChan <- true
+				epUpdates <- &proto.DataplaneInSync{}
 				Expect(datastore.numKVs()).To(Equal(4))
 				// Rate limit tick should trigger cleanup.
 				rateLimitTickerChan <- time.Now()
-				inSyncChan <- true
+				epUpdates <- &proto.DataplaneInSync{}
 				Expect(datastore.numKVs()).To(Equal(3))
 				rateLimitTickerChan <- time.Now()
-				inSyncChan <- true
+				epUpdates <- &proto.DataplaneInSync{}
 				Expect(datastore.numKVs()).To(Equal(2))
-			}, 1)
+			})
 
 			It("with concurrent datastore changes, it should handle key not found", func() {
 				// Kick off the resync.
@@ -322,7 +355,7 @@ var _ = Describe("Status", func() {
 				rateLimitTickerChan <- time.Now()
 				// But it should only try each delete once.
 				Expect(datastore.NumDeletes()).To(Equal(2))
-			}, 1)
+			})
 
 			Describe("with an error on the first 2 List() calls", func() {
 				JustBeforeEach(func() {
@@ -357,9 +390,9 @@ var _ = Describe("Status", func() {
 				It("should retry the deletes", func() {
 					// Kick off the first resync.
 					resyncTickerChan <- time.Now()
-					rateLimitTickerChan <- time.Now() // Triggers first delete.
-					rateLimitTickerChan <- time.Now() // Triggers second.
-					inSyncChan <- false               // Wait for next loop
+					rateLimitTickerChan <- time.Now()     // Triggers first delete.
+					rateLimitTickerChan <- time.Now()     // Triggers second.
+					epUpdates <- &proto.DataplaneInSync{} // Wait for next loop
 					Expect(datastore.numKVs()).To(Equal(4),
 						"datastore should still contain all original keys")
 					// Send in timer ticks to finish retries.
@@ -377,12 +410,12 @@ var _ = Describe("Status", func() {
 				By("deleting first endpoint immediately after resync")
 				time.Sleep(20 * time.Millisecond)
 				Eventually(datastore.numKVs).Should(Equal(4))
-			}, 1)
+			})
 			It("should process workload update", func() {
 				epUpdates <- &wlEPUpdateUp
 				rateLimitTickerChan <- time.Now() // Copy to active.
 				rateLimitTickerChan <- time.Now() // Do the write.
-				Eventually(datastore.snapshot).Should(Equal(map[model.Key]interface{}{
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
 					localWlEPKey:    wlEPUp,
 					localHostEPKey:  hostEPDown,
 					remoteWlEPKey:   wlEPUp,
@@ -397,7 +430,7 @@ var _ = Describe("Status", func() {
 				epUpdates <- &wlEPUpdateDown
 				rateLimitTickerChan <- time.Now()
 				rateLimitTickerChan <- time.Now()
-				Eventually(datastore.snapshot).Should(Equal(map[model.Key]interface{}{
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
 					localWlEPKey:    wlEPUp,
 					localHostEPKey:  hostEPDown,
 					remoteWlEPKey:   wlEPUp,
@@ -417,7 +450,7 @@ var _ = Describe("Status", func() {
 		})
 		Describe("after sending in-sync", func() {
 			JustBeforeEach(func() {
-				inSyncChan <- true
+				epUpdates <- &proto.DataplaneInSync{}
 			})
 			It("should only clean up local endpoints", func() {
 				// Kick off the resync.
@@ -426,11 +459,11 @@ var _ = Describe("Status", func() {
 				rateLimitTickerChan <- time.Now()
 				rateLimitTickerChan <- time.Now()
 				rateLimitTickerChan <- time.Now()
-				Eventually(datastore.snapshot).Should(Equal(map[model.Key]interface{}{
+				Eventually(datastore.snapshot).Should(Equal(map[model.Key]any{
 					remoteWlEPKey:   nil,
 					remoteHostEPKey: nil,
 				}))
-			}, 1)
+			})
 			It("should clean up one endpoint per tick", func() {
 				// Kick off the resync.
 				resyncTickerChan <- time.Now()
@@ -440,26 +473,23 @@ var _ = Describe("Status", func() {
 				By("deleting second endpoint after rate limit timer tick")
 				rateLimitTickerChan <- time.Now()
 				Eventually(datastore.numKVs).Should(Equal(2))
-			}, 1)
+			})
 		})
 	})
 })
 
 var _ = Describe("Non-mocked EndpointStatusReporter", func() {
 	var esr *EndpointStatusReporter
-	var epUpdates chan interface{}
-	var inSyncChan chan bool
+	var epUpdates chan any
 	var datastore *mockDatastore
 
 	BeforeEach(func() {
-		epUpdates = make(chan interface{})
-		inSyncChan = make(chan bool)
+		epUpdates = make(chan any)
 		datastore = newMockDatastore()
 		esr = NewEndpointStatusReporter(
 			hostname,
 			"",
 			epUpdates,
-			inSyncChan,
 			datastore,
 			10*time.Second,  // Rate limit.
 			100*time.Second, // Resync interval.
@@ -481,7 +511,7 @@ var _ = Describe("Non-mocked EndpointStatusReporter", func() {
 
 type mockDatastore struct {
 	mutex                           sync.Mutex
-	kvs                             map[model.Key]interface{}
+	kvs                             map[model.Key]any
 	workloadsListed, hostsListed    bool
 	ListErrs, ApplyErrs, DeleteErrs []error
 	numDeletes                      int
@@ -489,15 +519,15 @@ type mockDatastore struct {
 
 func newMockDatastore() *mockDatastore {
 	return &mockDatastore{
-		kvs: make(map[model.Key]interface{}),
+		kvs: make(map[model.Key]any),
 	}
 }
 
-func (d *mockDatastore) snapshot() map[model.Key]interface{} {
+func (d *mockDatastore) snapshot() map[model.Key]any {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	snap := make(map[model.Key]interface{})
+	snap := make(map[model.Key]any)
 	for k, v := range d.kvs {
 		// Return values rather than pointers for ease of comparison.
 		if v == nil {
@@ -527,7 +557,7 @@ func (d *mockDatastore) clear() {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	d.kvs = make(map[model.Key]interface{})
+	d.kvs = make(map[model.Key]any)
 }
 
 func (d *mockDatastore) List(ctx context.Context, list model.ListInterface, revision string) (*model.KVPairList, error) {

@@ -19,11 +19,12 @@ import (
 	"net"
 	"testing"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
 	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/felix/bpf/conntrack"
+	ctv4 "github.com/projectcalico/calico/felix/bpf/conntrack/v4"
 	"github.com/projectcalico/calico/felix/bpf/nat"
 	"github.com/projectcalico/calico/felix/bpf/routes"
 	tcdefs "github.com/projectcalico/calico/felix/bpf/tc/defs"
@@ -38,7 +39,7 @@ func TestSNATHostServiceRemotePod(t *testing.T) {
 
 	ipHdr := ipv4Default
 	ipHdr.Id = 1
-	eth, ipv4, l4, payload, pktBytes, err := testPacket(nil, ipHdr, nil, nil)
+	eth, ipv4, l4, payload, pktBytes, err := testPacketV4(nil, ipHdr, nil, nil)
 	Expect(err).NotTo(HaveOccurred())
 	udp := l4.(*layers.UDP)
 
@@ -100,20 +101,20 @@ func TestSNATHostServiceRemotePod(t *testing.T) {
 	runBpfTest(t, "calico_from_nat_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		pktR := gopacket.NewPacket(res.dataOut, layers.LayerTypeEthernet, gopacket.Default)
 		fmt.Printf("pktR = %+v\n", pktR)
 
 		ipv4Nat := *ipv4
 		ipv4Nat.DstIP = natIP
-		ipv4Nat.SrcIP = node1tunIP
+		ipv4Nat.SrcIP = ipv4.SrcIP
 
 		udpNat := *udp
 		udpNat.DstPort = layers.UDPPort(natPort)
 
 		// created the expected packet after NAT, with recalculated csums
-		_, _, _, _, resPktBytes, err := testPacket(eth, &ipv4Nat, &udpNat, payload)
+		_, _, _, _, resPktBytes, err := testPacketV4(eth, &ipv4Nat, &udpNat, payload)
 		Expect(err).NotTo(HaveOccurred())
 
 		// expect them to be the same
@@ -141,7 +142,7 @@ func TestSNATHostServiceRemotePod(t *testing.T) {
 	// Second packet - conntrack hit
 
 	ipHdr.Id = 2
-	eth, ipv4, _, payload, pktBytes, err = testPacket(nil, ipHdr, nil, nil)
+	eth, ipv4, _, payload, pktBytes, err = testPacketV4(nil, ipHdr, nil, nil)
 	Expect(err).NotTo(HaveOccurred())
 
 	skbMark = 0
@@ -149,20 +150,20 @@ func TestSNATHostServiceRemotePod(t *testing.T) {
 	runBpfTest(t, "calico_from_nat_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
 		res, err := bpfrun(pktBytes)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		pktR := gopacket.NewPacket(res.dataOut, layers.LayerTypeEthernet, gopacket.Default)
 		fmt.Printf("pktR = %+v\n", pktR)
 
 		ipv4Nat := *ipv4
 		ipv4Nat.DstIP = natIP
-		ipv4Nat.SrcIP = node1tunIP
+		ipv4Nat.SrcIP = ipv4.SrcIP
 
 		udpNat := *udp
 		udpNat.DstPort = layers.UDPPort(natPort)
 
 		// created the expected packet after NAT, with recalculated csums
-		_, _, _, _, resPktBytes, err := testPacket(eth, &ipv4Nat, &udpNat, payload)
+		_, _, _, _, resPktBytes, err := testPacketV4(eth, &ipv4Nat, &udpNat, payload)
 		Expect(err).NotTo(HaveOccurred())
 
 		// expect them to be the same
@@ -171,7 +172,7 @@ func TestSNATHostServiceRemotePod(t *testing.T) {
 		pktBytes = res.dataOut
 	})
 
-	// Out via wg tunnel (to intruduce ct entries)
+	// Out via wg tunnel (to introduce ct entries)
 
 	expectMark(tcdefs.MarkSeen | tcdefs.MarkSeenFromNatIfaceOut)
 
@@ -194,7 +195,7 @@ func TestSNATHostServiceRemotePod(t *testing.T) {
 		respPkt := udpResponseRaw(pktBytes)
 		res, err := bpfrun(respPkt)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		pktR := gopacket.NewPacket(res.dataOut, layers.LayerTypeEthernet, gopacket.Default)
 		fmt.Printf("pktR = %+v\n", pktR)
@@ -209,7 +210,7 @@ func TestSNATHostServiceRemotePod(t *testing.T) {
 		ethResp.SrcMAC, ethResp.DstMAC = ethResp.DstMAC, ethResp.SrcMAC
 
 		// created the expected packet after NAT, with recalculated csums
-		_, _, _, _, resPktBytes, err := testPacket(&ethResp, &ipResp, &udpResp, payload)
+		_, _, _, _, resPktBytes, err := testPacketV4(&ethResp, &ipResp, &udpResp, payload)
 		Expect(err).NotTo(HaveOccurred())
 
 		// expect them to be the same
@@ -264,7 +265,7 @@ func TestSNATHostServiceRemotePod(t *testing.T) {
 		respPkt := udpResponseRaw(hostConflictPktAfterSNAT)
 		res, err := bpfrun(respPkt)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.Retval).To(Equal(resTC_ACT_UNSPEC))
+		Expect(res.Retval).To(Equal(resTC_ACT_REDIRECT))
 
 		pktR := gopacket.NewPacket(res.dataOut, layers.LayerTypeEthernet, gopacket.Default)
 		fmt.Printf("pktR = %+v\n", pktR)
@@ -276,4 +277,69 @@ func TestSNATHostServiceRemotePod(t *testing.T) {
 		Expect(udpR.SrcPort).To(Equal(layers.UDPPort(natPort)))
 		Expect(udpR.DstPort).To(Equal(udpDefault.SrcPort))
 	}, withPSNATPorts(22222, 22222))
+}
+
+// TestSNATHostRecycledNATReverseNoConflict checks that a recycled entry's VIA_NAT_IF flag does not reach the new host connection.
+func TestSNATHostRecycledNATReverseNoConflict(t *testing.T) {
+	RegisterTestingT(t)
+
+	bpfIfaceName = "SNRc"
+	defer func() { bpfIfaceName = "" }()
+
+	ctMap := conntrack.Map()
+	Expect(ctMap.EnsureExists()).NotTo(HaveOccurred())
+	resetCTMap(ctMap)
+	defer resetCTMap(ctMap)
+
+	hostIP = node1ip
+	natIP := net.IPv4(8, 8, 8, 8).To4()
+	natPort := uint16(666)
+	srcPort := uint16(54321)
+
+	destCIDR := net.IPNet{IP: natIP, Mask: net.IPv4Mask(255, 255, 255, 0)}
+	defer resetRTMap(rtMap)
+	Expect(rtMap.Update(
+		routes.NewKey(ip.CIDRFromIPNet(&destCIDR).(ip.V4CIDR)).AsBytes(),
+		routes.NewValueWithNextHop(routes.FlagsRemoteWorkload|routes.FlagTunneled,
+			ip.FromNetIP(node2ip).(ip.V4Addr)).AsBytes(),
+	)).NotTo(HaveOccurred())
+
+	// A closed host->service connection that went via the NAT interface.
+	revKey := conntrack.NewKey(conntrack.ProtoTCP, srcIP, srcPort, natIP, natPort)
+	closedRev := conntrack.NewValueNATReverse(0, ctv4.FlagViaNATIf,
+		conntrack.Leg{SynSeen: true, AckSeen: true, FinSeen: true, Opener: true, Approved: true},
+		conntrack.Leg{SynSeen: true, AckSeen: true, FinSeen: true, Approved: true},
+		nil, net.IPv4(10, 96, 0, 1), 80)
+	Expect(ctMap.Update(revKey.AsBytes(), closedRev.AsBytes())).NotTo(HaveOccurred())
+
+	// The host now connects straight to the backend from the same port.
+	ipHdr := *ipv4Default
+	ipHdr.DstIP = natIP
+	ipHdr.Protocol = layers.IPProtocolTCP
+	tcpSyn := &layers.TCP{
+		SrcPort:    layers.TCPPort(srcPort),
+		DstPort:    layers.TCPPort(natPort),
+		SYN:        true,
+		DataOffset: 5,
+	}
+	_, _, _, _, synPkt, err := testPacketV4(nil, &ipHdr, tcpSyn, nil)
+	Expect(err).NotTo(HaveOccurred())
+
+	skbMark = 0
+	runBpfTest(t, "calico_to_host_ep", rulesDefaultAllow, func(bpfrun bpfProgRunFn) {
+		res, err := bpfrun(synPkt)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Retval).To(Or(Equal(resTC_ACT_UNSPEC), Equal(resTC_ACT_REDIRECT)))
+
+		pktR := gopacket.NewPacket(res.dataOut, layers.LayerTypeEthernet, gopacket.Default)
+		tcpL := pktR.Layer(layers.LayerTypeTCP)
+		Expect(tcpL).NotTo(BeNil())
+		Expect(tcpL.(*layers.TCP).SrcPort).To(Equal(layers.TCPPort(srcPort)),
+			"a new connection must not be source-NATed around the connection it replaced")
+	}, withPSNATPorts(22222, 22222), withHostNetworked())
+
+	ct, err := conntrack.LoadMapMem(ctMap)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(ct).To(HaveKey(revKey))
+	Expect(ct[revKey].Type()).To(Equal(conntrack.TypeNormal))
 }

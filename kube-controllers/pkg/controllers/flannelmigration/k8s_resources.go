@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,21 +15,26 @@
 package flannelmigration
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"os/exec"
+	"strings"
 	"time"
-
-	"k8s.io/apimachinery/pkg/labels"
-
-	"k8s.io/apimachinery/pkg/fields"
 
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/kubectl/pkg/drain"
 )
 
 // daemonset holds a collection of helper functions for Kubernetes daemonset.
@@ -88,7 +93,7 @@ func (d daemonset) getContainerSpec(k8sClientset *kubernetes.Clientset, namespac
 			return &c, nil
 		}
 	}
-	return nil, fmt.Errorf("No container with name %s found in daemonset", containerName)
+	return nil, fmt.Errorf("no container with name %s found in daemonset", containerName)
 }
 
 // Get container image from a container spec.
@@ -115,20 +120,20 @@ func (d daemonset) GetContainerEnv(k8sClientset *kubernetes.Clientset, namespace
 		}
 	}
 
-	return "", fmt.Errorf("No Env with name %s found in container %s", envName, containerName)
+	return "", fmt.Errorf("no Env with name %s found in container %s", envName, containerName)
 }
 
 // Wait for daemonset to disappear.
 func (d daemonset) WaitForDaemonsetNotFound(k8sClientset *kubernetes.Clientset, namespace string, interval, timeout time.Duration) error {
-	return wait.PollImmediate(interval, timeout, func() (bool, error) {
-		_, err := k8sClientset.AppsV1().DaemonSets(namespace).Get(context.Background(), string(d), metav1.GetOptions{})
+	return wait.PollUntilContextTimeout(context.Background(), interval, timeout, true, func(ctx context.Context) (bool, error) {
+		_, err := k8sClientset.AppsV1().DaemonSets(namespace).Get(ctx, string(d), metav1.GetOptions{})
 		if apierrs.IsNotFound(err) {
 			return true, nil
 		}
 		if err != nil {
 			return true, err
 		}
-		// Daemoset still exists, retry.
+		// Daemonset still exists, retry.
 		return false, nil
 	})
 }
@@ -288,8 +293,8 @@ func getPodContainerLog(k8sClientSet *kubernetes.Clientset, namespace, podName, 
 
 // waitForPodSuccessTimeout returns nil if the pod reached state success, or an error if it reached failure or ran too long.
 func waitForPodSuccessTimeout(k8sClientset *kubernetes.Clientset, podName, namespace string, interval, timeout time.Duration) error {
-	return wait.PollImmediate(interval, timeout, func() (bool, error) {
-		pod, err := k8sClientset.CoreV1().Pods(namespace).Get(context.Background(), podName, metav1.GetOptions{})
+	return wait.PollUntilContextTimeout(context.Background(), interval, timeout, true, func(ctx context.Context) (bool, error) {
+		pod, err := k8sClientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 		if err != nil {
 			// Cannot get pod yet, retry.
 			return false, err
@@ -312,8 +317,8 @@ type k8snode string
 // If node labels has been set already, do nothing.
 func (n k8snode) addNodeLabels(k8sClientset *kubernetes.Clientset, labelMaps ...map[string]string) error {
 	nodeName := string(n)
-	return wait.PollImmediate(1*time.Second, 1*time.Minute, func() (bool, error) {
-		node, err := k8sClientset.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	return wait.PollUntilContextTimeout(context.Background(), 1*time.Second, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
+		node, err := k8sClientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -330,7 +335,7 @@ func (n k8snode) addNodeLabels(k8sClientset *kubernetes.Clientset, labelMaps ...
 		}
 
 		if needUpdate {
-			_, err := k8sClientset.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
+			_, err := k8sClientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 			if err == nil {
 				return true, nil
 			}
@@ -351,8 +356,8 @@ func (n k8snode) addNodeLabels(k8sClientset *kubernetes.Clientset, labelMaps ...
 // If node labels do not exist, do nothing.
 func (n k8snode) removeNodeLabels(k8sClientset *kubernetes.Clientset, labelMaps ...map[string]string) error {
 	nodeName := string(n)
-	return wait.PollImmediate(1*time.Second, 1*time.Minute, func() (bool, error) {
-		node, err := k8sClientset.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	return wait.PollUntilContextTimeout(context.Background(), 1*time.Second, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
+		node, err := k8sClientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
@@ -368,7 +373,7 @@ func (n k8snode) removeNodeLabels(k8sClientset *kubernetes.Clientset, labelMaps 
 		}
 
 		if needUpdate {
-			_, err := k8sClientset.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
+			_, err := k8sClientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 			if err == nil {
 				return true, nil
 			}
@@ -425,7 +430,7 @@ func isPodRunningAndReady(pod *v1.Pod) bool {
 
 // Wait for a pod becoming ready on a node.
 func (n k8snode) waitPodReadyForNode(k8sClientset *kubernetes.Clientset, namespace string, interval, timeout time.Duration, label map[string]string) error {
-	return wait.PollImmediate(interval, timeout, func() (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), interval, timeout, true, func(context.Context) (bool, error) {
 		nodeName := string(n)
 		podList, err := k8sClientset.CoreV1().Pods(namespace).List(
 			context.Background(),
@@ -446,7 +451,7 @@ func (n k8snode) waitPodReadyForNode(k8sClientset *kubernetes.Clientset, namespa
 
 		if len(podList.Items) > 1 {
 			// Multiple pods, stop waiting
-			return true, fmt.Errorf("Getting multiple pod with label %v on node %s", label, nodeName)
+			return true, fmt.Errorf("getting multiple pod with label %v on node %s", label, nodeName)
 		}
 
 		pod := podList.Items[0]
@@ -461,7 +466,7 @@ func (n k8snode) waitPodReadyForNode(k8sClientset *kubernetes.Clientset, namespa
 }
 
 // Execute command in a pod on a node. Get command output.
-func (n k8snode) execCommandInPod(k8sClientset *kubernetes.Clientset, namespace, containerName string, label map[string]string, args ...string) (string, error) {
+func (n k8snode) execCommandInPod(k8sClientset *kubernetes.Clientset, restConfig *rest.Config, namespace, containerName string, label map[string]string, args ...string) (string, error) {
 	nodeName := string(n)
 	var pod v1.Pod
 	found := false
@@ -485,60 +490,133 @@ func (n k8snode) execCommandInPod(k8sClientset *kubernetes.Clientset, namespace,
 	}
 
 	if !found {
-		// Can not find pod.
-		return "", fmt.Errorf("Failed to execute command in pod. Can not find pod with label in %v on node %s", label, nodeName)
+		// Cannot find pod.
+		return "", fmt.Errorf("failed to execute command in pod. Cannot find pod with label in %v on node %s", label, nodeName)
 	}
 
 	if !isPodRunningAndReady(&pod) {
 		// Pod is not running and ready.
-		return "", fmt.Errorf("Failed to execute command in pod. Pod %s is not ready.", pod.Name)
+		return "", fmt.Errorf("failed to execute command in pod. Pod %s is not ready", pod.Name)
 	}
 
-	cmdArgs := []string{"exec", pod.Name, fmt.Sprintf("--namespace=%s", namespace), fmt.Sprintf("-c=%s", containerName), "--"}
-	cmdArgs = append(cmdArgs, args...)
-	out, err := exec.Command("/usr/bin/kubectl", cmdArgs...).CombinedOutput()
+	req := k8sClientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(pod.Name).
+		Namespace(namespace).
+		SubResource("exec").
+		VersionedParams(&v1.PodExecOptions{
+			Container: containerName,
+			Command:   args,
+			Stdout:    true,
+			Stderr:    true,
+		}, scheme.ParameterCodec)
+
+	executor, err := remotecommand.NewSPDYExecutor(restConfig, "POST", req.URL())
 	if err != nil {
-		log.Errorf("Kubectl exec %s(%s) error. \n ---%v--- \n%s\n ------", pod.Name, containerName, cmdArgs, string(out))
+		return "", fmt.Errorf("failed to build SPDY executor for %s/%s: %w", namespace, pod.Name, err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := executor.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	}); err != nil {
+		log.WithError(err).Errorf("Exec %s(%s) error. \n ---%v--- \nstdout:\n%s\nstderr:\n%s\n ------", pod.Name, containerName, args, stdout.String(), stderr.String())
 		return "", err
 	}
 
-	log.Infof("Kubectl exec %s(%s) completed successfully. \n ---%v--- \n%s\n ------", pod.Name, containerName, cmdArgs, string(out))
-	return string(out), nil
+	log.Infof("Exec %s(%s) completed successfully. \n ---%v--- \n%s\n ------", pod.Name, containerName, args, stdout.String())
+	return stdout.String(), nil
 }
 
-func (n k8snode) Drain() error {
+func (n k8snode) Drain(k8sClientset *kubernetes.Clientset) error {
 	nodeName := string(n)
 	log.Infof("Start drain node %s", nodeName)
-	out, err := exec.Command("/usr/bin/kubectl", "drain",
-		"--ignore-daemonsets", "--delete-local-data", "--force", nodeName).CombinedOutput()
-	if err != nil {
-		log.Errorf("Drain node %s. \n ---Drain Node--- \n%s\n ------", nodeName, string(out))
-		return err
+
+	helper := newDrainHelper(k8sClientset)
+	if err := cordonNode(k8sClientset, nodeName, true); err != nil {
+		return fmt.Errorf("failed to cordon node %s: %w", nodeName, err)
 	}
 
-	log.Infof("Drain node %s completed successfully. \n ---Drain Node Logs--- \n%s\n ------", nodeName, string(out))
+	list, errs := helper.GetPodsForDeletion(nodeName)
+	if len(errs) > 0 {
+		return fmt.Errorf("failed to list pods for drain on node %s: %w", nodeName, errors.Join(errs...))
+	}
+	if warnings := list.Warnings(); warnings != "" {
+		log.Warnf("Drain warnings for node %s: %s", nodeName, warnings)
+	}
+	if err := helper.DeleteOrEvictPods(list.Pods()); err != nil {
+		return fmt.Errorf("failed to drain node %s: %w", nodeName, err)
+	}
+
+	log.Infof("Drain node %s completed successfully.", nodeName)
 	return nil
 }
 
-func (n k8snode) Uncordon() error {
+func (n k8snode) Uncordon(k8sClientset *kubernetes.Clientset) error {
 	nodeName := string(n)
 	log.Infof("Start uncordon node %s", nodeName)
-	out, err := exec.Command("/usr/bin/kubectl", "uncordon", nodeName).CombinedOutput()
-	if err != nil {
-		log.Errorf("Uncordon node %s. \n ---Uncordon Node Logs--- \n%s\n ------", nodeName, string(out))
-		return err
+	if err := cordonNode(k8sClientset, nodeName, false); err != nil {
+		return fmt.Errorf("failed to uncordon node %s: %w", nodeName, err)
 	}
-
 	log.Infof("Uncordon node %s completed successfully.", nodeName)
 	return nil
 }
 
-func removeLabelForAllNodes(key string) error {
-	log.Infof("Start remove node label %s", key)
-	out, err := exec.Command("/usr/bin/kubectl", "label", "node", key+"-", "--all").CombinedOutput()
+// newDrainHelper returns a kubectl drain.Helper configured with the same
+// semantics as `kubectl drain --ignore-daemonsets --delete-emptydir-data --force`.
+func newDrainHelper(k8sClientset *kubernetes.Clientset) *drain.Helper {
+	return &drain.Helper{
+		Ctx:                 context.Background(),
+		Client:              k8sClientset,
+		Force:               true,
+		IgnoreAllDaemonSets: true,
+		DeleteEmptyDirData:  true,
+		GracePeriodSeconds:  -1,
+		Out:                 log.StandardLogger().WriterLevel(log.InfoLevel),
+		ErrOut:              log.StandardLogger().WriterLevel(log.WarnLevel),
+	}
+}
+
+// cordonNode sets the node's Unschedulable flag to the desired value using
+// kubectl's CordonHelper, which patches only when an update is required.
+func cordonNode(k8sClientset *kubernetes.Clientset, nodeName string, desired bool) error {
+	node, err := k8sClientset.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
 	if err != nil {
-		log.Errorf("Remove label node %s. \n ---Remove Node Label Logs--- \n %s \n ------", key, string(out))
 		return err
+	}
+	cordonHelper := drain.NewCordonHelper(node)
+	if !cordonHelper.UpdateIfRequired(desired) {
+		return nil
+	}
+	if err, patchErr := cordonHelper.PatchOrReplaceWithContext(context.Background(), k8sClientset, false); err != nil || patchErr != nil {
+		if err != nil {
+			return err
+		}
+		return patchErr
+	}
+	return nil
+}
+
+func removeLabelForAllNodes(k8sClientset *kubernetes.Clientset, key string) error {
+	log.Infof("Start remove node label %s", key)
+
+	nodes, err := k8sClientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list nodes: %w", err)
+	}
+
+	// Escape the label key per RFC 6901 so it can be used in a JSON Patch path.
+	escaped := strings.ReplaceAll(strings.ReplaceAll(key, "~", "~0"), "/", "~1")
+	patch := []byte(fmt.Sprintf(`[{"op":"remove","path":"/metadata/labels/%s"}]`, escaped))
+
+	for _, node := range nodes.Items {
+		if _, ok := node.Labels[key]; !ok {
+			continue
+		}
+		if _, err := k8sClientset.CoreV1().Nodes().Patch(context.Background(), node.Name, types.JSONPatchType, patch, metav1.PatchOptions{}); err != nil {
+			return fmt.Errorf("failed to remove label %s from node %s: %w", key, node.Name, err)
+		}
 	}
 
 	log.Infof("Remove node label %s completed successfully.", key)
@@ -576,7 +654,6 @@ func updateConfigMapValue(k8sClientset *kubernetes.Clientset, namespace, name, k
 
 	log.Infof("Config map %s updated %s=%s.", name, key, value)
 	return nil
-
 }
 
 // wait for a node label to disappear.
@@ -585,8 +662,8 @@ func (n k8snode) waitForNodeLabelDisappear(k8sClientset *kubernetes.Clientset, k
 	nodeName := string(n)
 	log.Infof("Waiting for node %s label %s to disappear.", nodeName, key)
 
-	return wait.PollImmediate(interval, timeout, func() (bool, error) {
-		node, err := k8sClientset.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	return wait.PollUntilContextTimeout(context.Background(), interval, timeout, true, func(ctx context.Context) (bool, error) {
+		node, err := k8sClientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			// Cannot get node, something wrong, stop waiting.
 			return true, err

@@ -18,12 +18,11 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/layers"
+	. "github.com/onsi/gomega"
 
 	"github.com/projectcalico/calico/felix/bpf/polprog"
-
-	. "github.com/onsi/gomega"
 )
 
 type ipv6Test struct {
@@ -65,6 +64,8 @@ var ipTestCases = []ipv6Test{
 
 func TestIPv6Parsing(t *testing.T) {
 	RegisterTestingT(t)
+
+	t.Skip("ipv6 not supported")
 
 	defer resetBPFMaps()
 

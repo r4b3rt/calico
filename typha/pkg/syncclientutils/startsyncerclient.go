@@ -20,7 +20,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
-
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/dedupebuffer"
 	"github.com/projectcalico/calico/typha/pkg/discovery"
 	"github.com/projectcalico/calico/typha/pkg/syncclient"
 	"github.com/projectcalico/calico/typha/pkg/syncproto"
@@ -53,22 +53,33 @@ func MustStartSyncerClientIfTyphaConfigured(
 		return false
 	}
 
+	var dedupeBuf *dedupebuffer.DedupeBuffer
+	if db, ok := cbs.(*dedupebuffer.DedupeBuffer); ok {
+		log.Debug("Callback is already a dedupe buffer.")
+		dedupeBuf = db
+	} else {
+		// Include a de-duplicating buffer to avoid putting backpressure on the
+		// Typha client.
+		log.Debug("Inserting dedupe buffer ahead of callbacks.")
+		dedupeBuf = dedupebuffer.New()
+		go dedupeBuf.SendToSinkForever(cbs)
+	}
+
 	// Use a remote Syncer, via the Typha server.
 	log.WithField("addr", typhaAddrs).Info("Connecting to Typha.")
 	typhaConnection := syncclient.New(
 		discoverer,
 		myVersion, myHostname, myInfo,
-		cbs,
+		dedupeBuf,
 		&syncclient.Options{
-			SyncerType:      syncerType,
-			ReadTimeout:     typhaConfig.ReadTimeout,
-			WriteTimeout:    typhaConfig.WriteTimeout,
-			KeyFile:         typhaConfig.KeyFile,
-			CertFile:        typhaConfig.CertFile,
-			CAFile:          typhaConfig.CAFile,
-			ServerCN:        typhaConfig.CN,
-			ServerURISAN:    typhaConfig.URISAN,
-			FIPSModeEnabled: typhaConfig.FIPSModeEnabled,
+			SyncerType:   syncerType,
+			ReadTimeout:  typhaConfig.ReadTimeout,
+			WriteTimeout: typhaConfig.WriteTimeout,
+			KeyFile:      typhaConfig.KeyFile,
+			CertFile:     typhaConfig.CertFile,
+			CAFile:       typhaConfig.CAFile,
+			ServerCN:     typhaConfig.CN,
+			ServerURISAN: typhaConfig.URISAN,
 		},
 	)
 	if err := typhaConnection.Start(context.Background()); err != nil {

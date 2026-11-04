@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2017 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2023 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,25 +14,67 @@
 
 package selector
 
-import "github.com/projectcalico/calico/libcalico-go/lib/selector/parser"
+import (
+	"fmt"
+	"strings"
 
-// Selector represents a label selector.
-type Selector interface {
-	// Evaluate evaluates the selector against the given labels expressed as a concrete map.
-	Evaluate(labels map[string]string) bool
+	"github.com/projectcalico/calico/libcalico-go/lib/selector/parser"
+)
 
-	// EvaluateLabels evaluates the selector against the given labels expressed as an interface.
-	// This allows for labels that are calculated on the fly.
-	EvaluateLabels(labels parser.Labels) bool
+// NoMatch is a pre-calculated selector that always evaluates to false.
+// It matches nothing.
+var NoMatch *Selector
 
-	// String returns a string that represents this selector.
-	String() string
+// All is a pre-calculated selector that always evaluates to true. It matches
+// everything.
+var All *Selector
 
-	// UniqueID returns the unique ID that represents this selector.
-	UniqueID() string
+func init() {
+	var err error
+	NoMatch, err = Parse("!all()")
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse !all(): %v", err))
+	}
+	All, err = Parse("all()")
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse all(): %v", err))
+	}
 }
 
+// Selector represents a label selector.
+type Selector = parser.Selector
+
 // Parse a string representation of a selector expression into a Selector.
-func Parse(selector string) (sel Selector, err error) {
+func Parse(selector string) (sel *Selector, err error) {
 	return parser.Parse(selector)
+}
+
+// LabelEquals returns a selector equivalent to parsing `label == "value"`.  It
+// returns an error if the label is invalid or the value contains both ' and ".
+func LabelEquals(label, value string) (*Selector, error) {
+	return parser.LabelEquals(label, value)
+}
+
+const (
+	MaxAPIDepth   = parser.MaxAPIDepth
+	MaxParseDepth = parser.MaxParseDepth
+)
+
+// Validate checks the syntax of the given selector and that its parentheses
+// are nested at most maxDepth deep.  Use MaxAPIDepth for selectors from
+// the API and MaxParseDepth for selectors that Calico derived from them.
+func Validate(selector string, maxDepth int) (err error) {
+	return parser.Validate(selector, maxDepth)
+}
+
+// Normalise converts the given selector to the form returned by
+// Selector.String(), i.e. "" is converted to "all()" and whitespace is
+// tidied up.  If the input string cannot be parsed, it is returned unaltered.
+func Normalise(selector string) string {
+	selector = strings.TrimSpace(selector)
+	parsed, err := Parse(selector)
+	if err != nil {
+		return selector
+	}
+	return parsed.String()
 }

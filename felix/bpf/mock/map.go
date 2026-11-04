@@ -1,4 +1,6 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+//go:build !windows
+
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +18,8 @@ package mock
 
 import (
 	"fmt"
+	maps0 "maps"
+	"sync"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
@@ -24,6 +28,7 @@ import (
 )
 
 type Map struct {
+	sync.Mutex
 	maps.MapParameters
 	logCxt *logrus.Entry
 
@@ -68,12 +73,14 @@ func (m *Map) Path() string {
 
 func (m *Map) Iter(f maps.IterCallback) error {
 	m.IterCount++
-
 	if m.IterErr != nil {
 		return m.IterErr
 	}
 
-	for kstr, vstr := range m.Contents {
+	// Take a copy so that we don't run into trouble with the callback calling
+	// methods that take locks.
+	contents := m.copyContents()
+	for kstr, vstr := range contents {
 		action := f([]byte(kstr), []byte(vstr))
 		if action == maps.IterDelete {
 			delete(m.Contents, kstr)
@@ -82,7 +89,26 @@ func (m *Map) Iter(f maps.IterCallback) error {
 	return nil
 }
 
+func (m *Map) Size() int {
+	return m.MaxEntries
+}
+
+func (m *Map) copyContents() map[string]string {
+	m.Lock()
+	defer m.Unlock()
+	contentsCopy := map[string]string{}
+	maps0.Copy(contentsCopy, m.Contents)
+	return contentsCopy
+}
+
 func (m *Map) Update(k, v []byte) error {
+	m.Lock()
+	defer m.Unlock()
+
+	return m.updateUnlocked(k, v)
+}
+
+func (m *Map) updateUnlocked(k, v []byte) error {
 	m.UpdateCount++
 	if m.UpdateErr != nil {
 		return m.UpdateErr
@@ -100,16 +126,35 @@ func (m *Map) Update(k, v []byte) error {
 }
 
 func (m *Map) UpdateWithFlags(k, v []byte, flags int) error {
+	m.Lock()
+	defer m.Unlock()
+
 	if (flags & unix.BPF_EXIST) != 0 {
 		if _, ok := m.Contents[string(k)]; ok {
 			return fmt.Errorf("key exists")
 		}
 	}
 
-	return m.Update(k, v)
+	return m.updateUnlocked(k, v)
+}
+
+func (m *Map) BatchUpdate(k, v [][]byte, flags uint64) (int, error) {
+	m.Lock()
+	defer m.Unlock()
+	count := 0
+	for i := range k {
+		if err := m.updateUnlocked(k[i], v[i]); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
 }
 
 func (m *Map) Get(k []byte) ([]byte, error) {
+	m.Lock()
+	defer m.Unlock()
+
 	m.GetCount++
 
 	vstr, ok := m.Contents[string(k)]
@@ -120,6 +165,9 @@ func (m *Map) Get(k []byte) ([]byte, error) {
 }
 
 func (m *Map) Delete(k []byte) error {
+	m.Lock()
+	defer m.Unlock()
+
 	m.DeleteCount++
 	if m.DeleteErr != nil {
 		return m.DeleteErr
@@ -145,6 +193,9 @@ func (m *Map) CopyDeltaFromOldMap() error {
 }
 
 func (m *Map) ContainsKey(k []byte) bool {
+	m.Lock()
+	defer m.Unlock()
+
 	_, ok := m.Contents[string(k)]
 	return ok
 }
@@ -223,12 +274,20 @@ func (*DummyMap) Update(k, v []byte) error {
 	return nil
 }
 
+func (*DummyMap) BatchUpdate(k, v [][]byte, flags uint64) (int, error) {
+	return 0, nil
+}
+
 func (*DummyMap) Get(k []byte) ([]byte, error) {
 	return nil, unix.ENOENT
 }
 
 func (*DummyMap) Delete(k []byte) error {
 	return nil
+}
+
+func (*DummyMap) Size() int {
+	return 0
 }
 
 func (*DummyMap) CopyDeltaFromOldMap() error {

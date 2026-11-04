@@ -20,6 +20,8 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/projectcalico/calico/libcalico-go/lib/apis/internalapi"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 )
 
@@ -258,6 +260,9 @@ func ParseWorkloadEndpointName(wepName string) (WorkloadEndpointIdentifiers, err
 			orchFlds = otherFields
 		}
 		if pl > 2 {
+			if len(parts[2:]) > len(orchFlds) {
+				return WorkloadEndpointIdentifiers{}, fmt.Errorf("Error parsing %s, verify that WorkloadEndpoint name is correct", wepName)
+			}
 			weidR := reflect.ValueOf(&weid)
 			weidStruct := weidR.Elem()
 			for i, part := range parts[2:] {
@@ -267,4 +272,29 @@ func ParseWorkloadEndpointName(wepName string) (WorkloadEndpointIdentifiers, err
 		}
 	}
 	return weid, nil
+}
+
+func ConvertWorkloadEndpointV3KeyToV1Key(v3key model.ResourceKey) (model.WorkloadEndpointKey, error) {
+	parts := ExtractDashSeparatedParms(v3key.Name, 4)
+	if len(parts) != 4 || v3key.Namespace == "" {
+		return model.WorkloadEndpointKey{}, errors.New("not enough information provided to create v1 Workload Endpoint Key")
+	}
+	return model.WorkloadEndpointKey{
+		Hostname:       parts[0],
+		OrchestratorID: parts[1],
+		WorkloadID:     v3key.Namespace + "/" + parts[2],
+		EndpointID:     parts[3],
+	}, nil
+}
+
+func IdentifiersForV3WorkloadEndpoint(res *internalapi.WorkloadEndpoint) WorkloadEndpointIdentifiers {
+	wepids := WorkloadEndpointIdentifiers{
+		Node:         res.Spec.Node,
+		Orchestrator: res.Spec.Orchestrator,
+		Endpoint:     res.Spec.Endpoint,
+		Workload:     res.Spec.Workload,
+		Pod:          res.Spec.Pod,
+		ContainerID:  res.Spec.ContainerID,
+	}
+	return wepids
 }

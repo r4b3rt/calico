@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2016-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,29 +16,30 @@ package conversion
 
 import (
 	"fmt"
+	"math/bits"
 	"sort"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
-	kapiv1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	discovery "k8s.io/api/discovery/v1"
-	networkingv1 "k8s.io/api/networking/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
-
+	"github.com/google/uuid"
 	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	"github.com/projectcalico/api/pkg/lib/numorstring"
+	log "github.com/sirupsen/logrus"
+	kapiv1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	clusternetpol "sigs.k8s.io/network-policy-api/apis/v1alpha2"
 
+	"github.com/projectcalico/calico/lib/std/intervals"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
 	cerrors "github.com/projectcalico/calico/libcalico-go/lib/errors"
 	"github.com/projectcalico/calico/libcalico-go/lib/names"
 	cnet "github.com/projectcalico/calico/libcalico-go/lib/net"
 )
 
-var (
-	protoTCP = kapiv1.ProtocolTCP
-)
+var protoTCP = kapiv1.ProtocolTCP
 
 type selectorType int8
 
@@ -56,8 +57,8 @@ type Converter interface {
 	IsScheduled(pod *kapiv1.Pod) bool
 	IsHostNetworked(pod *kapiv1.Pod) bool
 	HasIPAddress(pod *kapiv1.Pod) bool
-	StagedKubernetesNetworkPolicyToStagedName(stagedK8sName string) string
 	K8sNetworkPolicyToCalico(np *networkingv1.NetworkPolicy) (*model.KVPair, error)
+	K8sClusterNetworkPolicyToCalico(kcnp *clusternetpol.ClusterNetworkPolicy) (*model.KVPair, error)
 	EndpointSliceToKVP(svc *discovery.EndpointSlice) (*model.KVPair, error)
 	ServiceToKVP(service *kapiv1.Service) (*model.KVPair, error)
 	ProfileNameToNamespace(profileName string) (string, error)
@@ -99,13 +100,18 @@ func (c converter) NamespaceToProfile(ns *kapiv1.Namespace) (*model.KVPair, erro
 	// based on name within the namespaceSelector.
 	labels[NamespaceLabelPrefix+NameLabel] = ns.Name
 
+	uid, err := ConvertUID(ns.UID)
+	if err != nil {
+		return nil, err
+	}
+
 	// Create the profile object.
 	name := NamespaceProfileNamePrefix + ns.Name
 	profile := apiv3.NewProfile()
 	profile.ObjectMeta = metav1.ObjectMeta{
 		Name:              name,
 		CreationTimestamp: ns.CreationTimestamp,
-		UID:               ns.UID,
+		UID:               uid,
 	}
 	profile.Spec = apiv3.ProfileSpec{
 		Ingress:       []apiv3.Rule{{Action: apiv3.Allow}},
@@ -237,11 +243,6 @@ func getPodIPs(pod *kapiv1.Pod) ([]*cnet.IPNet, error) {
 	return podIPNets, nil
 }
 
-// StagedKubernetesNetworkPolicyToStagedName converts a StagedKubernetesNetworkPolicy name into a StagedNetworkPolicy name
-func (c converter) StagedKubernetesNetworkPolicyToStagedName(stagedK8sName string) string {
-	return fmt.Sprintf(K8sNetworkPolicyNamePrefix + stagedK8sName)
-}
-
 // EndpointSliceToKVP converts a k8s EndpointSlice to a model.KVPair.
 func (c converter) EndpointSliceToKVP(slice *discovery.EndpointSlice) (*model.KVPair, error) {
 	return &model.KVPair{
@@ -267,11 +268,15 @@ func (c converter) ServiceToKVP(service *kapiv1.Service) (*model.KVPair, error) 
 	}, nil
 }
 
+func ensureProtocol(proto kapiv1.Protocol) kapiv1.Protocol {
+	if proto != "" {
+		return proto
+	}
+	return kapiv1.ProtocolTCP
+}
+
 // K8sNetworkPolicyToCalico converts a k8s NetworkPolicy to a model.KVPair.
 func (c converter) K8sNetworkPolicyToCalico(np *networkingv1.NetworkPolicy) (*model.KVPair, error) {
-	// Pull out important fields.
-	policyName := fmt.Sprintf(K8sNetworkPolicyNamePrefix + np.Name)
-
 	// We insert all the NetworkPolicy Policies at order 1000.0 after conversion.
 	// This order might change in future.
 	order := float64(1000.0)
@@ -281,7 +286,7 @@ func (c converter) K8sNetworkPolicyToCalico(np *networkingv1.NetworkPolicy) (*mo
 	// Generate the ingress rules list.
 	var ingressRules []apiv3.Rule
 	for _, r := range np.Spec.Ingress {
-		rules, err := c.k8sRuleToCalico(r.From, r.Ports, np.Namespace, true)
+		rules, err := c.k8sRuleToCalico(r.From, r.Ports, true)
 		if err != nil {
 			log.WithError(err).Warn("dropping k8s rule that couldn't be converted.")
 			// Add rule to conversion error slice
@@ -294,7 +299,7 @@ func (c converter) K8sNetworkPolicyToCalico(np *networkingv1.NetworkPolicy) (*mo
 	// Generate the egress rules list.
 	var egressRules []apiv3.Rule
 	for _, r := range np.Spec.Egress {
-		rules, err := c.k8sRuleToCalico(r.To, r.Ports, np.Namespace, false)
+		rules, err := c.k8sRuleToCalico(r.To, r.Ports, false)
 		if err != nil {
 			log.WithError(err).Warn("dropping k8s rule that couldn't be converted")
 			// Add rule to conversion error slice
@@ -315,12 +320,12 @@ func (c converter) K8sNetworkPolicyToCalico(np *networkingv1.NetworkPolicy) (*mo
 			egress = true
 		}
 	}
-	types := []apiv3.PolicyType{}
+	policyTypes := []apiv3.PolicyType{}
 	if ingress {
-		types = append(types, apiv3.PolicyTypeIngress)
+		policyTypes = append(policyTypes, apiv3.PolicyTypeIngress)
 	}
 	if egress {
-		types = append(types, apiv3.PolicyTypeEgress)
+		policyTypes = append(policyTypes, apiv3.PolicyTypeEgress)
 	} else if len(egressRules) > 0 {
 		// Egress was introduced at the same time as policyTypes.  It shouldn't be possible to
 		// receive a NetworkPolicy with an egress rule but without "Egress" specified in its types,
@@ -331,33 +336,43 @@ func (c converter) K8sNetworkPolicyToCalico(np *networkingv1.NetworkPolicy) (*mo
 	// If no types were specified in the policy, then we're running on a cluster that doesn't
 	// include support for that field in the API.  In that case, the correct behavior is for the policy
 	// to apply to only ingress traffic.
-	if len(types) == 0 {
-		types = append(types, apiv3.PolicyTypeIngress)
+	if len(policyTypes) == 0 {
+		policyTypes = append(policyTypes, apiv3.PolicyTypeIngress)
+	}
+
+	var uid types.UID
+	var err error
+	if np.UID != "" {
+		uid, err = ConvertUID(np.UID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Create the NetworkPolicy.
 	policy := apiv3.NewNetworkPolicy()
 	policy.ObjectMeta = metav1.ObjectMeta{
-		Name:              policyName,
+		Name:              np.Name,
 		Namespace:         np.Namespace,
 		CreationTimestamp: np.CreationTimestamp,
-		UID:               np.UID,
+		UID:               uid,
 		ResourceVersion:   np.ResourceVersion,
 	}
 	policy.Spec = apiv3.NetworkPolicySpec{
 		Order:    &order,
-		Selector: c.k8sSelectorToCalico(&np.Spec.PodSelector, SelectorPod),
+		Tier:     names.DefaultTierName,
+		Selector: k8sSelectorToCalico(&np.Spec.PodSelector, SelectorPod),
 		Ingress:  ingressRules,
 		Egress:   egressRules,
-		Types:    types,
+		Types:    policyTypes,
 	}
 
 	// Build the KVPair.
 	kvp := &model.KVPair{
 		Key: model.ResourceKey{
-			Name:      policyName,
+			Name:      np.Name,
 			Namespace: np.Namespace,
-			Kind:      apiv3.KindNetworkPolicy,
+			Kind:      model.KindKubernetesNetworkPolicy,
 		},
 		Value:    policy,
 		Revision: np.ResourceVersion,
@@ -369,7 +384,7 @@ func (c converter) K8sNetworkPolicyToCalico(np *networkingv1.NetworkPolicy) (*mo
 
 // k8sSelectorToCalico takes a namespaced k8s label selector and returns the Calico
 // equivalent.
-func (c converter) k8sSelectorToCalico(s *metav1.LabelSelector, selectorType selectorType) string {
+func k8sSelectorToCalico(s *metav1.LabelSelector, selectorType selectorType) string {
 	// Only prefix pod selectors - this won't work for namespace selectors.
 	selectors := []string{}
 	if selectorType == SelectorPod {
@@ -419,7 +434,11 @@ func (c converter) k8sSelectorToCalico(s *metav1.LabelSelector, selectorType sel
 	return strings.Join(selectors, " && ")
 }
 
-func (c converter) k8sRuleToCalico(rPeers []networkingv1.NetworkPolicyPeer, rPorts []networkingv1.NetworkPolicyPort, ns string, ingress bool) ([]apiv3.Rule, error) {
+func (c converter) k8sRuleToCalico(
+	rPeers []networkingv1.NetworkPolicyPeer,
+	rPorts []networkingv1.NetworkPolicyPort,
+	ingress bool,
+) ([]apiv3.Rule, error) {
 	rules := []apiv3.Rule{}
 	peers := []*networkingv1.NetworkPolicyPeer{}
 	ports := []*networkingv1.NetworkPolicyPort{}
@@ -513,7 +532,7 @@ func (c converter) k8sRuleToCalico(rPeers []networkingv1.NetworkPolicyPeer, rPor
 		}
 
 		for _, peer := range peers {
-			selector, nsSelector, nets, notNets := c.k8sPeerToCalicoFields(peer, ns)
+			selector, nsSelector, nets, notNets := c.k8sPeerToCalicoFields(peer)
 			if ingress {
 				// Build inbound rule and append to list.
 				rules = append(rules, apiv3.Rule{
@@ -555,67 +574,39 @@ func SimplifyPorts(ports []numorstring.Port) []numorstring.Port {
 	if len(ports) <= 1 {
 		return ports
 	}
-	var numericPorts []int
-	var outputPorts []numorstring.Port
+	var numericPorts intervals.Set[uint16]
+	numericPorts.Grow(len(ports))
+	numNamedPorts := 0
+	numPortsCovered := 0
 	for _, p := range ports {
 		if p.PortName != "" {
-			// Pass named ports through immediately, there's nothing to be done for them.
-			outputPorts = append(outputPorts, p)
-		} else {
-			// Work with ints to avoid overflow with the uint16 port type.
-			// In practice, we currently only get single ports here so this
-			// loop should run exactly once.
-			for i := int(p.MinPort); i <= int(p.MaxPort); i++ {
-				numericPorts = append(numericPorts, i)
-			}
+			numNamedPorts++
+			continue
 		}
+		// Add panics if MinPort > MaxPort, but callers build ports with the
+		// numorstring constructors, which reject that.
+		numericPorts.Add(p.MinPort, p.MaxPort)
+		numPortsCovered += int(p.MaxPort) - int(p.MinPort) + 1
 	}
 
-	if len(numericPorts) <= 1 {
+	if numPortsCovered <= 1 {
 		// We have nothing to combine, short-circuit.
 		return ports
 	}
 
-	// Sort the ports so it will be easy to find ranges.
-	sort.Ints(numericPorts)
-
-	// Each pass around this outer loop extracts one port range from the sorted slice
-	// and it moves the slice along to the start of the next range.
-	for len(numericPorts) > 0 {
-		// Initialise the next range to the contain only the first port in the slice.
-		firstPortInRange := numericPorts[0]
-		lastPortInRange := firstPortInRange
-
-		// Scan ahead, looking for ports that can be combined into this range.
-		numericPorts = numericPorts[1:]
-		for len(numericPorts) > 0 {
-			nextPort := numericPorts[0]
-			if nextPort > lastPortInRange+1 {
-				// This port can't be coalesced with the existing range, break out so
-				// that we record the range; then we'll loop again and pick up this
-				// port as the start of a new range.
-				break
-			}
-			// The next port is either equal to the last port (due to a duplicate port
-			// in the input) or it is exactly one greater.  Extend the range to include
-			// it.
-			lastPortInRange = nextPort
-			numericPorts = numericPorts[1:]
+	// Coalescing usually shrinks the numeric ports a lot, so size the output
+	// after coalescing rather than to len(ports).
+	outputPorts := make([]numorstring.Port, 0, numNamedPorts+numericPorts.NumIntervals())
+	for _, p := range ports {
+		if p.PortName != "" {
+			// Pass named ports through, there's nothing to be done for them.
+			outputPorts = append(outputPorts, p)
 		}
-
-		// Record the port.
-		outputPorts = appendPortRange(outputPorts, firstPortInRange, lastPortInRange)
 	}
-
+	for minPort, maxPort := range numericPorts.Coalesced() {
+		outputPorts = append(outputPorts, numorstring.Port{MinPort: minPort, MaxPort: maxPort})
+	}
 	return outputPorts
-}
-
-func appendPortRange(ports []numorstring.Port, first, last int) []numorstring.Port {
-	portRange, err := numorstring.PortFromRange(uint16(first), uint16(last))
-	if err != nil {
-		log.WithError(err).Panic("Failed to make port range from ports that should have been pre-validated.")
-	}
-	return append(ports, portRange)
 }
 
 func (c converter) k8sPortToCalicoFields(port *networkingv1.NetworkPolicyPort) (protocol *numorstring.Protocol, dstPorts []numorstring.Port, err error) {
@@ -628,11 +619,11 @@ func (c converter) k8sPortToCalicoFields(port *networkingv1.NetworkPolicyPort) (
 	if err != nil {
 		return
 	}
-	protocol = c.k8sProtocolToCalico(port.Protocol)
+	protocol = k8sProtocolToCalico(port.Protocol)
 	return
 }
 
-func (c converter) k8sProtocolToCalico(protocol *kapiv1.Protocol) *numorstring.Protocol {
+func k8sProtocolToCalico(protocol *kapiv1.Protocol) *numorstring.Protocol {
 	if protocol != nil {
 		p := numorstring.ProtocolFromString(string(*protocol))
 		return &p
@@ -640,7 +631,7 @@ func (c converter) k8sProtocolToCalico(protocol *kapiv1.Protocol) *numorstring.P
 	return nil
 }
 
-func (c converter) k8sPeerToCalicoFields(peer *networkingv1.NetworkPolicyPeer, ns string) (selector, nsSelector string, nets []string, notNets []string) {
+func (c converter) k8sPeerToCalicoFields(peer *networkingv1.NetworkPolicyPeer) (selector, nsSelector string, nets []string, notNets []string) {
 	// If no peer, return zero values for all fields (selector, nets and !nets).
 	if peer == nil {
 		return
@@ -671,8 +662,8 @@ func (c converter) k8sPeerToCalicoFields(peer *networkingv1.NetworkPolicyPeer, n
 
 	// IPBlock is not set to get here.
 	// Note that k8sSelectorToCalico() accepts nil values of the selector.
-	selector = c.k8sSelectorToCalico(peer.PodSelector, SelectorPod)
-	nsSelector = c.k8sSelectorToCalico(peer.NamespaceSelector, SelectorNamespace)
+	selector = k8sSelectorToCalico(peer.PodSelector, SelectorPod)
+	nsSelector = k8sSelectorToCalico(peer.NamespaceSelector, SelectorNamespace)
 	return
 }
 
@@ -731,12 +722,17 @@ func (c converter) ServiceAccountToProfile(sa *kapiv1.ServiceAccount) (*model.KV
 	// based on name within the serviceAccountSelector.
 	labels[ServiceAccountLabelPrefix+NameLabel] = sa.Name
 
+	uid, err := ConvertUID(sa.UID)
+	if err != nil {
+		return nil, err
+	}
+
 	name := serviceAccountNameToProfileName(sa.Name, sa.Namespace)
 	profile := apiv3.NewProfile()
 	profile.ObjectMeta = metav1.ObjectMeta{
 		Name:              name,
 		CreationTimestamp: sa.CreationTimestamp,
-		UID:               sa.UID,
+		UID:               uid,
 	}
 	profile.Spec.LabelsToApply = labels
 
@@ -754,7 +750,6 @@ func (c converter) ServiceAccountToProfile(sa *kapiv1.ServiceAccount) (*model.KV
 
 // ProfileNameToServiceAccount extracts the ServiceAccount name from the given Profile name.
 func (c converter) ProfileNameToServiceAccount(profileName string) (ns, sa string, err error) {
-
 	// Profile objects backed by ServiceAccounts have form "ksa.<namespace>.<sa_name>"
 	if !strings.HasPrefix(profileName, ServiceAccountProfileNamePrefix) {
 		// This is not backed by a Kubernetes ServiceAccount.
@@ -798,14 +793,34 @@ func (c converter) SplitProfileRevision(rev string) (nsRev string, saRev string,
 	return
 }
 
-func stringsToIPNets(ipStrings []string) ([]*cnet.IPNet, error) {
-	var podIPNets []*cnet.IPNet
-	for _, ip := range ipStrings {
-		_, ipNet, err := cnet.ParseCIDROrIP(ip)
-		if err != nil {
-			return nil, err
-		}
-		podIPNets = append(podIPNets, ipNet)
+// ConvertUID converts a UID to a new UID in a deterministic way. This is useful when we want to generate a new UID
+// for a resource that is derived from another resource, but we don't want to use the same UID in order to
+// ensure that the new resource is treated as unique. This is important, as two objects with the same UID causes
+// confusion in the Kubernetes garbage collection logic.
+func ConvertUID(uid types.UID) (types.UID, error) {
+	parsed, err := uuid.Parse(string(uid))
+	if err != nil {
+		return "", fmt.Errorf("failed to parse UID for resource: %s", err)
 	}
-	return podIPNets, nil
+	reversed, err := reverseUID(parsed)
+	if err != nil {
+		return "", fmt.Errorf("failed to reverse UID for resource: %s", err)
+	}
+	return types.UID(reversed.String()), nil
+}
+
+func reverseUID(uid uuid.UUID) (uuid.UUID, error) {
+	// v4 UUIDs used by Kubernetes use bits in the 7th byte to indicate the version and
+	// bits in the 9th byte to indicate the variant. Reverse the bits in the surrounding bytes but leave these intact.
+	nuid := make([]byte, len(uid))
+
+	// Reverse all bytes first.
+	for i := range len(uid) {
+		nuid[i] = bits.Reverse8(uid[i])
+	}
+
+	// Then restore version and variant.
+	nuid[6], nuid[8] = uid[6], uid[8]
+
+	return uuid.FromBytes(nuid)
 }

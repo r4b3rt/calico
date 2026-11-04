@@ -34,18 +34,54 @@ func SetMapSize(size int) {
 
 const (
 	KeySize    = 4
-	ValueSize  = 4 + 16 + 3*4 + 2*4
-	MaxEntries = 1000
+	ValueSize  = 4 + 16 + 3*4 + 3*4 + 2*4
+	MaxEntries = 1000 // must be the same as IFACE_STATE_MAP_SIZE in ifstate.h
 )
 
 const (
-	FlgWEP   = uint32(0x1)
-	FlgReady = uint32(0x2)
+	FlgWEP        = uint32(0x1)
+	FlgIPv4Ready  = uint32(0x2)
+	FlgIPv6Ready  = uint32(0x4)
+	FlgHEP        = uint32(0x8)
+	FlgBond       = uint32(0x10)
+	FlgBondSlave  = uint32(0x20)
+	FlgVxlan      = uint32(0x40)
+	FlgIPIP       = uint32(0x80)
+	FlgWireguard  = uint32(0x100)
+	FlgL3         = uint32(0x200)
+	FlgNotManaged = uint32(0x400)
+	FlgMax        = uint32(0x7ff)
 )
 
 var flagsToStr = map[uint32]string{
-	FlgWEP:   "workload",
-	FlgReady: "ready",
+	FlgWEP:        "workload",
+	FlgIPv4Ready:  "v4Ready",
+	FlgIPv6Ready:  "v6Ready",
+	FlgHEP:        "host",
+	FlgBond:       "bond",
+	FlgBondSlave:  "bondslave",
+	FlgVxlan:      "vxlan",
+	FlgIPIP:       "ipip",
+	FlgWireguard:  "wg",
+	FlgL3:         "l3",
+	FlgNotManaged: "notmanaged",
+}
+
+// FlagNames returns the human-readable names for the set bits in flags.
+// When no flags are set, returns ["host"] to match Value.String() semantics.
+func FlagNames(flags uint32) []string {
+	if flags == 0 {
+		return []string{"host"}
+	}
+	var names []string
+	for k := FlgWEP; k <= FlgMax; k *= 2 {
+		if flags&k != 0 {
+			if name, ok := flagsToStr[k]; ok {
+				names = append(names, name)
+			}
+		}
+	}
+	return names
 }
 
 var MapParams = maps.MapParameters{
@@ -55,7 +91,7 @@ var MapParams = maps.MapParameters{
 	MaxEntries:   MaxEntries,
 	Name:         "cali_iface",
 	Flags:        unix.BPF_F_NO_PREALLOC,
-	Version:      3,
+	Version:      4,
 	UpdatedByBPF: false,
 }
 
@@ -93,16 +129,30 @@ func KeyFromBytes(b []byte) Key {
 
 type Value [ValueSize]byte
 
-func NewValue(flags uint32, name string, xdpPol, ingressPol, egressPol, tcIngressFilter, tcEgressFilter int) Value {
+func NewValue(
+	flags uint32,
+	name string,
+	xdpPolIPv4,
+	ingressPolIPv4,
+	egressPolIPv4,
+	xdpPolIPv6,
+	ingressPolIPv6,
+	egressPolIPv6,
+	tcIngressFilter,
+	tcEgressFilter int,
+) Value {
 	var v Value
 
 	binary.LittleEndian.PutUint32(v[:], flags)
 	copy(v[4:4+15], []byte(name))
-	binary.LittleEndian.PutUint32(v[4+16+0:4+16+4], uint32(xdpPol))
-	binary.LittleEndian.PutUint32(v[4+16+4:4+16+8], uint32(ingressPol))
-	binary.LittleEndian.PutUint32(v[4+16+8:4+16+12], uint32(egressPol))
-	binary.LittleEndian.PutUint32(v[4+16+12:4+16+16], uint32(tcIngressFilter))
-	binary.LittleEndian.PutUint32(v[4+16+16:4+16+20], uint32(tcEgressFilter))
+	binary.LittleEndian.PutUint32(v[4+16+0:4+16+4], uint32(xdpPolIPv4))
+	binary.LittleEndian.PutUint32(v[4+16+4:4+16+8], uint32(ingressPolIPv4))
+	binary.LittleEndian.PutUint32(v[4+16+8:4+16+12], uint32(egressPolIPv4))
+	binary.LittleEndian.PutUint32(v[4+16+12:4+16+16], uint32(xdpPolIPv6))
+	binary.LittleEndian.PutUint32(v[4+16+16:4+16+20], uint32(ingressPolIPv6))
+	binary.LittleEndian.PutUint32(v[4+16+20:4+16+24], uint32(egressPolIPv6))
+	binary.LittleEndian.PutUint32(v[4+16+24:4+16+28], uint32(tcIngressFilter))
+	binary.LittleEndian.PutUint32(v[4+16+28:4+16+32], uint32(tcEgressFilter))
 
 	return v
 }
@@ -119,31 +169,44 @@ func (v Value) IfName() string {
 	return strings.TrimRight(string(v[4:4+16]), "\x00")
 }
 
-func (v Value) XDPPolicy() int {
+func (v Value) XDPPolicyV4() int {
 	return int(int32(binary.LittleEndian.Uint32(v[4+16 : 4+16+4])))
 }
 
-func (v Value) IngressPolicy() int {
+func (v Value) IngressPolicyV4() int {
 	return int(int32(binary.LittleEndian.Uint32(v[4+16+4 : 4+16+8])))
 }
 
-func (v Value) EgressPolicy() int {
+func (v Value) EgressPolicyV4() int {
 	return int(int32(binary.LittleEndian.Uint32(v[4+16+8 : 4+16+12])))
 }
 
-func (v Value) TcIngressFilter() int {
+func (v Value) XDPPolicyV6() int {
 	return int(int32(binary.LittleEndian.Uint32(v[4+16+12 : 4+16+16])))
 }
 
-func (v Value) TcEgressFilter() int {
+func (v Value) IngressPolicyV6() int {
 	return int(int32(binary.LittleEndian.Uint32(v[4+16+16 : 4+16+20])))
+}
+
+func (v Value) EgressPolicyV6() int {
+	return int(int32(binary.LittleEndian.Uint32(v[4+16+20 : 4+16+24])))
+}
+
+func (v Value) TcIngressFilter() int {
+	return int(int32(binary.LittleEndian.Uint32(v[4+16+24 : 4+16+28])))
+}
+
+func (v Value) TcEgressFilter() int {
+	return int(int32(binary.LittleEndian.Uint32(v[4+16+28 : 4+16+32])))
 }
 
 func (v Value) String() string {
 	fstr := ""
 	f := v.Flags()
 
-	for k, v := range flagsToStr {
+	for k := FlgWEP; k < FlgMax; k *= 2 {
+		v := flagsToStr[k]
 		if f&k != 0 {
 			fstr = fstr + v + ","
 		}
@@ -153,8 +216,9 @@ func (v Value) String() string {
 		fstr = "host,"
 	}
 
-	return fmt.Sprintf("{flags: %s XDPPolicy: %d, IngressPolicy: %d, EgressPolicy: %d, name: %s}",
-		fstr, v.XDPPolicy(), v.IngressPolicy(), v.EgressPolicy(), v.IfName())
+	return fmt.Sprintf(
+		"{flags: %s XDPPolicyV4: %d, IngressPolicyV4: %d, EgressPolicyV4: %d, XDPPolicyV6: %d, IngressPolicyV6: %d, EgressPolicyV6: %d, IngressFilter: %d, EgressFilter: %d, name: %s}",
+		fstr, v.XDPPolicyV4(), v.IngressPolicyV4(), v.EgressPolicyV4(), v.XDPPolicyV6(), v.IngressPolicyV6(), v.EgressPolicyV6(), v.TcIngressFilter(), v.TcEgressFilter(), v.IfName())
 }
 
 func ValueFromBytes(b []byte) Value {

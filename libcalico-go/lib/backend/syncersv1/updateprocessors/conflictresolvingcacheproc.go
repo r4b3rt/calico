@@ -16,6 +16,7 @@ package updateprocessors
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 
 	log "github.com/sirupsen/logrus"
@@ -68,7 +69,7 @@ func NewConflictResolvingCacheUpdateProcessor(v3Kind string, converter ConvertV2
 
 type ConvertV2ToV1 func(kvp *model.KVPair) (*model.KVPair, error)
 
-// conflictResolvingCache implements the ConflictRecolvingCache interface.
+// conflictResolvingCache implements the ConflictResolvingCache interface.
 type conflictResolvingCache struct {
 	v3Kind              string
 	converter           ConvertV2ToV1
@@ -147,13 +148,7 @@ func (c *conflictResolvingCache) Process(kvp *model.KVPair) ([]*model.KVPair, er
 	// Get the current set of names that map to this key, and if this name is not
 	// in the list - add it and sort the list.
 	cns := c.orderedNamesByV1Key[v1Key]
-	inList := false
-	for _, cn := range cns {
-		if cn == name {
-			inList = true
-			break
-		}
-	}
+	inList := slices.Contains(cns, name)
 	if !inList {
 		cns = append(cns, name)
 		sort.Strings(cns)

@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,27 +17,25 @@ package status_test
 import (
 	"context"
 	"errors"
+	"os"
 	"time"
 
-	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/nodestatussyncer"
-
-	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/projectcalico/calico/libcalico-go/lib/options"
-	"github.com/projectcalico/calico/node/pkg/lifecycle/utils"
-	populator "github.com/projectcalico/calico/node/pkg/status/populators"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
-	"github.com/projectcalico/calico/node/pkg/status"
-
+	apiv3 "github.com/projectcalico/api/pkg/apis/projectcalico/v3"
 	log "github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	"github.com/projectcalico/calico/libcalico-go/lib/backend"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/api"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/model"
+	"github.com/projectcalico/calico/libcalico-go/lib/backend/syncersv1/nodestatussyncer"
 	client "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
+	"github.com/projectcalico/calico/libcalico-go/lib/options"
+	"github.com/projectcalico/calico/node/pkg/lifecycle/utils"
+	"github.com/projectcalico/calico/node/pkg/status"
+	populator "github.com/projectcalico/calico/node/pkg/status/populators"
 )
 
 const (
@@ -53,6 +51,10 @@ var _ = Describe("Node status FV tests", func() {
 	Expect(err).NotTo(HaveOccurred())
 	cfg.Spec = apiconfig.CalicoAPIConfigSpec{
 		DatastoreType: apiconfig.Kubernetes,
+		KubeConfig: apiconfig.KubeConfig{
+			Kubeconfig:     os.Getenv("KUBECONFIG"),
+			CalicoAPIGroup: os.Getenv("CALICO_API_GROUP"),
+		},
 	}
 
 	c, err := client.New(*cfg)
@@ -86,14 +88,14 @@ var _ = Describe("Node status FV tests", func() {
 
 	v4Peer := &apiv3.CalicoNodePeer{
 		PeerIP: "172.17.8.104",
-		Type:   apiv3.RouteSourceTypeNodeMesh,
+		Type:   apiv3.BGPPeerTypeNodeMesh,
 		State:  apiv3.BGPSessionStateEstablished,
 		Since:  "2016-11-21",
 	}
 
 	v6Peer := &apiv3.CalicoNodePeer{
 		PeerIP: "2001:20::8",
-		Type:   apiv3.RouteSourceTypeNodeMesh,
+		Type:   apiv3.BGPPeerTypeNodeMesh,
 		State:  apiv3.BGPSessionStateEstablished,
 		Since:  "2016-11-21",
 	}
@@ -142,7 +144,6 @@ var _ = Describe("Node status FV tests", func() {
 	}
 
 	Context("Mock bird connections", func() {
-
 		BeforeEach(func() {
 			err = be.Clean()
 			Expect(err).ToNot(HaveOccurred())
@@ -278,7 +279,6 @@ var _ = Describe("Node status FV tests", func() {
 			Eventually(func() int {
 				return r.GetNumberOfReporters()
 			}, 2*time.Second, 500*time.Millisecond).Should(Equal(0))
-
 		})
 	})
 
@@ -325,6 +325,42 @@ var _ = Describe("Node status FV tests", func() {
 			Expect(new.Status.BGP).To(Equal(emptyBGP))
 			Expect(new.Status.Routes).To(Equal(emptyRoutes))
 		})
+	})
+
+	Specify("Reporter should handle conflict in case of syncer missing update", func() {
+		// Create reporter without syncer, because we are going to simulate syncer missing update
+		mock := newMockBird(v4Status, v6Status, v4Peer, v6Peer, v4Route, v6Route)
+		r := status.NewNodeStatusReporter(nodeName, cfg, c, getPopulators(mock))
+		go r.Run()
+		defer r.Stop()
+
+		// Create a node status request with update period of 5 seconds, notify reporter
+		Expect(be.Clean()).NotTo(HaveOccurred())
+		createCalicoNodeStatus(c, nodeName, name, 5)
+		r.OnUpdates([]api.Update{
+			{KVPair: model.KVPair{Key: model.ResourceKey{Name: name}, Value: getCurrentStatus()}},
+		})
+		r.OnStatusUpdated(api.InSync)
+
+		// Wait for first immediate status update
+		var firstStatus *apiv3.CalicoNodeStatus
+		Eventually(func() metav1.Time {
+			firstStatus = getCurrentStatus()
+			return firstStatus.Status.LastUpdated
+		}, 2*time.Second, 500*time.Millisecond).Should(Not(BeZero()))
+
+		// Update object, but do not notify reporter (simulate syncer missing update)
+		newPeriod := uint32(1)
+		secondStatus := firstStatus.DeepCopy()
+		secondStatus.Spec.UpdatePeriodSeconds = &newPeriod
+		_, err = c.CalicoNodeStatus().Update(context.Background(), secondStatus, options.SetOptions{})
+		Expect(err).To(Not(HaveOccurred()))
+
+		// Update actual state and wait reporter to resolve conflict and update status
+		mock.setLastBootTime(BootTimeSecond)
+		Eventually(func() metav1.Time {
+			return getCurrentStatus().Status.LastUpdated
+		}, 10*time.Second, 500*time.Millisecond).Should(Not(Equal(firstStatus.Status.LastUpdated)))
 	})
 })
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2017-2025 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,30 +16,31 @@ package dataplane
 
 import (
 	"fmt"
-	"net"
-	"net/http"
 	"os/exec"
-	"strconv"
-	"time"
-
-	log "github.com/sirupsen/logrus"
-	"k8s.io/client-go/kubernetes"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	log "github.com/sirupsen/logrus"
+	"k8s.io/client-go/kubernetes"
 
+	"github.com/projectcalico/calico/felix/calc"
+	"github.com/projectcalico/calico/felix/collector"
 	"github.com/projectcalico/calico/felix/config"
 	windataplane "github.com/projectcalico/calico/felix/dataplane/windows"
 	"github.com/projectcalico/calico/felix/dataplane/windows/hns"
 	"github.com/projectcalico/calico/libcalico-go/lib/health"
+	"github.com/projectcalico/calico/libcalico-go/lib/ipam"
 )
 
 func StartDataplaneDriver(configParams *config.Config,
 	healthAggregator *health.HealthAggregator,
+	collector collector.Collector,
 	configChangedRestartCallback func(),
 	fatalErrorCallback func(error),
-	k8sClientSet *kubernetes.Clientset) (DataplaneDriver, *exec.Cmd) {
+	k8sClientSet kubernetes.Interface,
+	_ *calc.LookupsCache,
+	_ ipam.Interface,
+) (DataplaneDriver, *exec.Cmd) {
 	log.Info("Using Windows dataplane driver.")
 
 	dpConfig := windataplane.Config{
@@ -58,15 +59,16 @@ func StartDataplaneDriver(configParams *config.Config,
 	return winDP, nil
 }
 
+// NFTablesEnabled resolves the configured NFTablesMode; Windows has no nftables dataplane.
+func NFTablesEnabled(configParams *config.Config) bool {
+	return false
+}
+
 func SupportsBPF() error {
 	return fmt.Errorf("BPF dataplane is not supported on Windows")
 }
 
-func ServePrometheusMetrics(configParams *config.Config) {
-	log.WithFields(log.Fields{
-		"host": configParams.PrometheusMetricsHost,
-		"port": configParams.PrometheusMetricsPort,
-	}).Info("Starting prometheus metrics endpoint")
+func ConfigurePrometheusMetrics(configParams *config.Config) {
 	if configParams.PrometheusGoMetricsEnabled && configParams.PrometheusProcessMetricsEnabled {
 		log.Info("Including Golang, and Process metrics")
 	} else {
@@ -78,13 +80,5 @@ func ServePrometheusMetrics(configParams *config.Config) {
 			log.Info("Discarding process metrics")
 			prometheus.Unregister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 		}
-	}
-	http.Handle("/metrics", promhttp.Handler())
-	addr := net.JoinHostPort(configParams.PrometheusMetricsHost, strconv.Itoa(configParams.PrometheusMetricsPort))
-	for {
-		err := http.ListenAndServe(addr, nil)
-		log.WithError(err).Error(
-			"Prometheus metrics endpoint failed, trying to restart it...")
-		time.Sleep(1 * time.Second)
 	}
 }

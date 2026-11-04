@@ -14,57 +14,59 @@
 
 package parser
 
-import "sort"
+import (
+	"sort"
 
-type StringSet []string
+	"github.com/projectcalico/calico/lib/std/uniquestr"
+)
+
+type StringSet []uniquestr.Handle
 
 // Contains returns true if a given string in current set
-func (ss StringSet) Contains(s string) bool {
-	if len(ss) == 0 {
-		// Empty set or nil.
-		return false
-	}
-	// There's at least one item, do a binary chop to find the correct
-	// entry.  [minIdx, maxIdx) defines the (half-open) search interval.
-	minIdx := 0
-	maxIdx := len(ss)
-	for minIdx < (maxIdx - 1) {
-		// Select the partition index. The loop condition ensures that
-		// minIdx < partitionIdx < maxIdx so we'll always shrink the
-		// search interval on each iteration.
-		partitionIdx := (minIdx + maxIdx) / 2
-		partition := ss[partitionIdx]
-		if s < partition {
-			// target is strictly less than the partition, we can
-			// move maxIdx down.
-			maxIdx = partitionIdx
-		} else {
-			// Target is >= the partition, move minIdx up.
-			minIdx = partitionIdx
-		}
-	}
-	// When we exit the loop, minIdx == (maxIdx - 1).  Since the interval
-	// is half-open that means that, if the value is present, it must be at
-	// minIdx.  (minIdx cannot equal maxIdx due to the empty list check
-	// above and the loop condition.)
-	return ss[minIdx] == s
+func (ss StringSet) Contains(s uniquestr.Handle) bool {
+	// Defer to the binary search impl in the stdlib.  Note: it returns
+	// the "insertion point" for inserting the given string, so we need to
+	// check that the string really is there.
+	idx := sort.Search(len(ss), func(i int) bool { return ss[i].Value() >= s.Value() })
+	return idx < len(ss) && ss[idx] == s
 }
 
-func ConvertToStringSetInPlace(s []string) StringSet {
-	if s != nil {
-		sort.Strings(s)
+// SliceCopy returns a new slice that contains the elements of the set in
+// sorted order.
+func (ss StringSet) SliceCopy() []uniquestr.Handle {
+	if ss == nil {
+		return nil
 	}
-	j := 0
-	var last string
-	for _, v := range s {
-		if j != 0 && last == v {
-			// Same as last value, skip.
+	cp := make([]uniquestr.Handle, len(ss), len(ss))
+	copy(cp, ss)
+	return cp
+}
+
+func (ss StringSet) StringSlice() []string {
+	if ss == nil {
+		return nil
+	}
+	out := make([]string, len(ss), len(ss))
+	for i, h := range ss {
+		out[i] = h.Value()
+	}
+	return out
+}
+
+func ConvertToStringSetInPlace(s []uniquestr.Handle) StringSet {
+	if len(s) <= 1 {
+		// Nothing to do for nil, zero or a single-entry slice.
+		return s
+	}
+	sort.Slice(s, func(i, j int) bool {
+		return s[i].Value() < s[j].Value()
+	})
+	out := s[:1]
+	for _, v := range s[1:] {
+		if v == out[len(out)-1] {
 			continue
 		}
-		s[j] = v
-		j++
-		last = v
+		out = append(out, v)
 	}
-	s = s[:j]
-	return StringSet(s)
+	return out
 }

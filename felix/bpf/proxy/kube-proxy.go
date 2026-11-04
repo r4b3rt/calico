@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2021 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,61 +17,77 @@ package proxy
 import (
 	"net"
 	"sync"
+	"time"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/projectcalico/calico/felix/bpf/bpfmap"
 	"github.com/projectcalico/calico/felix/bpf/maps"
-	"github.com/projectcalico/calico/felix/bpf/nat"
 	"github.com/projectcalico/calico/felix/bpf/routes"
-	"github.com/projectcalico/calico/felix/cachingmap"
+	"github.com/projectcalico/calico/felix/ip"
+	"github.com/projectcalico/calico/felix/proto"
 )
-
-func init() {
-	// Alpha since 1.21 Beta since 1.22 default true - no harm in supporting it by default.
-	_ = utilfeature.DefaultMutableFeatureGate.Set("ServiceInternalTrafficPolicy=true")
-}
 
 // KubeProxy is a wrapper of Proxy that deals with higher level issue like
 // configuration, restarting etc.
 type KubeProxy struct {
-	proxy  Proxy
+	proxy  ProxyFrontend
 	syncer DPSyncer
 
+	// pendingHostMetadataUpdates contains HostMetadataUpdate and HostMetadataRemove messages
+	// that we're batching up to send. Only accessed from the int-dataplane goroutine.
+	// Keyed by hostname (node name).
+	pendingHostMetadataUpdates map[string]any
+	// hostMetadataUpdates is a size-1 channel - allows for one non-blocking write,
+	// and repeated updates get merged into older unconsumed ones.
+	hostMetadataUpdates    chan map[string]any
+	inSyncWithIntDataplane bool
+
+	ipFamily      int
 	hostIPUpdates chan []net.IP
 	stopOnce      sync.Once
 	lock          sync.RWMutex
 	exiting       chan struct{}
 	wg            sync.WaitGroup
 
-	k8s         kubernetes.Interface
-	hostname    string
-	frontendMap maps.MapWithExistsCheck
-	backendMap  maps.MapWithExistsCheck
-	affinityMap maps.Map
-	ctMap       maps.Map
-	rt          *RTCache
-	opts        []Option
+	k8s           kubernetes.Interface
+	hostname      string
+	frontendMap   maps.MapWithExistsCheck
+	backendMap    maps.MapWithExistsCheck
+	MaglevMap     maps.MapWithExistsCheck
+	maglevLUTSize int
+	affinityMap   maps.Map
+	ctMap         maps.Map
+	rt            *RTCache
+	opts          []Option
+
+	excludedCIDRs *ip.CIDRTrie
 
 	dsrEnabled bool
+
+	ctlbUDPAffinityTimeo time.Duration
 }
 
 // StartKubeProxy start a new kube-proxy if there was no error
 func StartKubeProxy(k8s kubernetes.Interface, hostname string,
-	bpfMaps *bpfmap.Maps, opts ...Option) (*KubeProxy, error) {
+	bpfMaps *bpfmap.IPMaps, opts ...Option) (*KubeProxy, error) {
 
 	kp := &KubeProxy{
 		k8s:         k8s,
+		ipFamily:    4,
 		hostname:    hostname,
 		frontendMap: bpfMaps.FrontendMap.(maps.MapWithExistsCheck),
 		backendMap:  bpfMaps.BackendMap.(maps.MapWithExistsCheck),
+		MaglevMap:   bpfMaps.MaglevMap.(maps.MapWithExistsCheck),
 		affinityMap: bpfMaps.AffinityMap,
 		ctMap:       bpfMaps.CtMap,
 		opts:        opts,
 		rt:          NewRTCache(),
+
+		hostMetadataUpdates:        make(chan map[string]any, 1),
+		pendingHostMetadataUpdates: make(map[string]any),
 
 		hostIPUpdates: make(chan []net.IP, 1),
 		exiting:       make(chan struct{}),
@@ -93,6 +109,10 @@ func StartKubeProxy(k8s kubernetes.Interface, hostname string,
 	return kp, nil
 }
 
+func (kp *KubeProxy) setIpFamily(ipFamily int) {
+	kp.ipFamily = ipFamily
+}
+
 // Stop stops KubeProxy and waits for it to exit
 func (kp *KubeProxy) Stop() {
 	kp.stopOnce.Do(func() {
@@ -100,98 +120,149 @@ func (kp *KubeProxy) Stop() {
 		defer kp.lock.Unlock()
 
 		close(kp.exiting)
+		close(kp.hostMetadataUpdates)
 		close(kp.hostIPUpdates)
-		kp.proxy.Stop()
+		if kp.proxy != nil {
+			// kp.proxy is nil if Stop is called before start() has
+			// received its initial host IPs and host-metadata updates.
+			kp.proxy.Stop()
+		}
 		kp.wg.Wait()
 	})
 }
 
-func (kp *KubeProxy) run(hostIPs []net.IP) error {
+func (kp *KubeProxy) setProxyHostMetadata(hostMetadata map[string]*proto.HostMetadataUpdate) {
+	kp.lock.Lock()
+	defer kp.lock.Unlock()
+
+	kp.proxy.SetHostMetadata(hostMetadata, true)
+}
+
+func (kp *KubeProxy) run(hostIPs []net.IP, hostMetadata map[string]*proto.HostMetadataUpdate) error {
+
+	ips := make([]net.IP, 0, len(hostIPs))
+	for _, ip := range hostIPs {
+		if kp.ipFamily == 4 && ip.To4() != nil {
+			ips = append(ips, ip)
+		} else if kp.ipFamily == 6 && ip.To4() == nil {
+			ips = append(ips, ip)
+		}
+	}
+
+	hostIPs = ips
 
 	kp.lock.Lock()
 	defer kp.lock.Unlock()
 
 	withLocalNP := make([]net.IP, len(hostIPs), len(hostIPs)+1)
 	copy(withLocalNP, hostIPs)
-	withLocalNP = append(withLocalNP, podNPIP)
+	if kp.ipFamily == 4 {
+		withLocalNP = append(withLocalNP, podNPIP)
+	} else {
+		withLocalNP = append(withLocalNP, podNPIPV6)
+	}
 
-	feCache := cachingmap.New[nat.FrontendKey, nat.FrontendValue](nat.FrontendMapParameters.Name,
-		maps.NewTypedMap[nat.FrontendKey, nat.FrontendValue](
-			kp.frontendMap, nat.FrontendKeyFromBytes, nat.FrontendValueFromBytes,
-		))
-	beCache := cachingmap.New[nat.BackendKey, nat.BackendValue](nat.BackendMapParameters.Name,
-		maps.NewTypedMap[nat.BackendKey, nat.BackendValue](
-			kp.backendMap, nat.BackendKeyFromBytes, nat.BackendValueFromBytes,
-		))
-
-	syncer, err := NewSyncer(withLocalNP, feCache, beCache, kp.affinityMap, kp.rt)
+	syncer, err := NewSyncer(kp.ipFamily, withLocalNP, kp.frontendMap, kp.backendMap, kp.MaglevMap, kp.affinityMap,
+		kp.rt, kp.excludedCIDRs, kp.maglevLUTSize, kp.ctlbUDPAffinityTimeo)
 	if err != nil {
 		return errors.WithMessage(err, "new bpf syncer")
 	}
 
-	proxy, err := New(kp.k8s, syncer, kp.hostname, kp.opts...)
-	if err != nil {
-		return errors.WithMessage(err, "new proxy")
+	if kp.proxy == nil {
+		// First call from start(): construct the proxy with a syncer
+		// that already knows the real host IPs. proxy.New() spins up
+		// the k8s informer goroutines synchronously, so by the time
+		// they sync and trigger an Apply, the syncer's desired state
+		// will include all (realHostIP, nodePort) FE entries.
+		// Constructing the proxy any earlier risks an Apply against a
+		// syncer that lacks real host IPs, which would gut pre-existing
+		// (realHostIP, nodePort) NAT FE entries left by the previous
+		// Felix run and break external NodePort traffic. See #12192.
+		proxy, err := New(kp.k8s, syncer, kp.hostname, kp.opts...)
+		if err != nil {
+			return errors.WithMessage(err, "new proxy")
+		}
+		proxy.SetHostIPs(hostIPs)
+		proxy.SetHostMetadata(hostMetadata, false)
+		kp.proxy = proxy
+	} else {
+		kp.proxy.SetHostIPs(hostIPs)
+		// Don't bother invoking a resync within SetHostMetadata; we will be syncing a fresh syncer right after.
+		kp.proxy.SetHostMetadata(hostMetadata, false)
+		kp.proxy.SetSyncer(syncer)
 	}
 
-	log.Infof("kube-proxy started, hostname=%q hostIPs=%+v", kp.hostname, hostIPs)
+	log.Infof("kube-proxy v%d node info updated, hostname=%q hostIPs=%+v", kp.ipFamily, kp.hostname, hostIPs)
 
-	kp.proxy = proxy
 	kp.syncer = syncer
 
 	return nil
 }
 
 func (kp *KubeProxy) start() error {
+	// Block until we have the first batch of host IPs AND the
+	// host-metadata in-sync signal (sent by CompleteDeferredWork after
+	// the int_dataplane has finished its first datastore-in-sync
+	// apply). Only then construct the proxy, via run(). proxy.New()
+	// kicks off the k8s informer goroutines synchronously; once those
+	// sync, they trigger Apply on the syncer. Constructing the proxy
+	// before we have real host IPs lets that Apply run against a
+	// syncer whose desired state lacks every (realHostIP, nodePort)
+	// FE entry, which then erases pre-existing entries left by the
+	// previous Felix run and breaks external NodePort traffic during
+	// the kube-proxy bootstrap window. See projectcalico/calico#12192.
+	var hostIPs []net.IP
+	select {
+	case ips, ok := <-kp.hostIPUpdates:
+		if !ok {
+			return nil
+		}
+		hostIPs = ips
+	case <-kp.exiting:
+		return nil
+	}
 
-	// wait for the initial update
-	hostIPs := <-kp.hostIPUpdates
+	hostMetadata := make(map[string]*proto.HostMetadataUpdate)
+	select {
+	case updates, ok := <-kp.hostMetadataUpdates:
+		if !ok {
+			return nil
+		}
+		mergeHostMetadataUpdates(hostMetadata, updates)
+	case <-kp.exiting:
+		return nil
+	}
 
-	err := kp.run(hostIPs)
-	if err != nil {
+	if err := kp.run(hostIPs, hostMetadata); err != nil {
 		return err
 	}
 
-	kp.wg.Add(1)
-	go func() {
-		defer kp.wg.Done()
+	kp.wg.Go(func() {
 		for {
-			hostIPs, ok := <-kp.hostIPUpdates
-			if !ok {
-				defer log.Error("kube-proxy stopped since hostIPUpdates closed")
-				kp.proxy.Stop()
+			select {
+			case hostIPs, ok := <-kp.hostIPUpdates:
+				if !ok {
+					log.Error("kube-proxy: hostIPUpdates closed")
+					return
+				}
+				if err := kp.run(hostIPs, hostMetadata); err != nil {
+					log.Panic("kube-proxy failed to resync after host IPs update")
+				}
+
+			case hostMetadataUpdates, ok := <-kp.hostMetadataUpdates:
+				if !ok {
+					log.Error("kube-proxy: hostMetadataUpdates closed")
+					return
+				}
+				mergeHostMetadataUpdates(hostMetadata, hostMetadataUpdates)
+				kp.setProxyHostMetadata(hostMetadata)
+
+			case <-kp.exiting:
+				log.Info("kube-proxy: exiting")
 				return
 			}
-
-			stopped := make(chan struct{})
-
-			go func() {
-				defer close(stopped)
-				defer log.Info("kube-proxy stopped to restart with updated host IPs")
-				kp.proxy.Stop()
-			}()
-
-		waitforstop:
-			for {
-				select {
-				case hostIPs, ok = <-kp.hostIPUpdates:
-					if !ok {
-						log.Error("kube-proxy: hostIPUpdates closed")
-						return
-					}
-				case <-kp.exiting:
-					log.Info("kube-proxy: exiting")
-					return
-				case <-stopped:
-					err = kp.run(hostIPs)
-					if err != nil {
-						log.Panic("kube-proxy failed to start after host IPs update")
-					}
-					break waitforstop
-				}
-			}
 		}
-	}()
+	})
 
 	return nil
 }
@@ -214,18 +285,101 @@ func (kp *KubeProxy) OnHostIPsUpdate(IPs []net.IP) {
 	log.Debugf("kube-proxy OnHostIPsUpdate: %+v", IPs)
 }
 
-// OnRouteUpdate should be used to update the internal state of routing tables
-func (kp *KubeProxy) OnRouteUpdate(k routes.Key, v routes.Value) {
-	if err := kp.rt.Update(k, v); err != nil {
-		log.WithField("error", err).Error("kube-proxy: OnRouteUpdate")
-	} else {
-		log.WithFields(log.Fields{"key": k, "value": v}).Debug("kube-proxy: OnRouteUpdate")
+// OnUpdate implements the manager interface.
+// Writes updates to pending updates map - overwrites repeated updates for the same key.
+func (kp *KubeProxy) OnUpdate(msg any) {
+	hostname := ""
+	switch update := msg.(type) {
+	case *proto.HostMetadataUpdate:
+		hostname = update.Hostname
+		log.WithField("msg", update).Debugf("kube-proxy OnUpdate: host metadata update")
+	case *proto.HostMetadataRemove:
+		hostname = update.Hostname
+		log.WithField("msg", update).Debugf("kube-proxy OnUpdate: host metadata remove")
+	default:
+		return
+	}
+
+	if hostname == "" {
+		log.WithField("msg", msg).Warn("kube-proxy OnUpdate: got host metadata update with empty hostname")
+		return
+	}
+
+	kp.pendingHostMetadataUpdates[hostname] = msg
+}
+
+// CompleteDeferredWork implements the manager interface.
+// Avoids blocking the thread by draining & merging older updates on the channel before sending.
+func (kp *KubeProxy) CompleteDeferredWork() error {
+	// If not in-sync with felix, we allow sending an empty update
+	// to signal to the KP loop that it can start looping.
+	if len(kp.pendingHostMetadataUpdates) == 0 && kp.inSyncWithIntDataplane {
+		log.Debug("No pending host metadata updates to process")
+		return nil
+	}
+
+	// Drain any pre-existing msg first and merge.
+	updates := kp.pollHostMetadataUpdatesNonBlocking()
+	if updates == nil {
+		updates = make(map[string]any)
+	}
+
+	// Overwrite any pre-existing updates for a given key.
+	// Always send 'Removes' instead of just deleting updates of the same key (since downstream may need to see a remove).
+	for k, v := range kp.pendingHostMetadataUpdates {
+		updates[k] = v
+		log.WithField("nodeName", k).Debug("Queueing new host metadata update")
+		// ... And clear the pending updates after processing.
+		delete(kp.pendingHostMetadataUpdates, k)
+	}
+
+	// Send the merged updates back down the channel.
+	log.Debug("Queueing new hostmetadata for main loop")
+	kp.hostMetadataUpdates <- updates
+	log.Debug("Successfully queued new hostmetadata")
+	kp.inSyncWithIntDataplane = true
+	return nil
+}
+
+// pollHostMetadataUpdatesNonBlocking tries to read a pending host metadata update on the update channel.
+// Returns nil immediately, if nothing can be received from the updates channel.
+func (kp *KubeProxy) pollHostMetadataUpdatesNonBlocking() map[string]any {
+	select {
+	case upd := <-kp.hostMetadataUpdates:
+		return upd
+	default:
+		return nil
 	}
 }
 
+// mergeHostMetadataUpdates merges the existing host metadata updates with the latest updates:
+// - A 'remove' in latest deletes the corresponding key in 'existing'.
+// - An 'update' in latest overwrites the corresponding key in 'existing'.
+// - If 'latest' is nil, does nothing. 'existing' must be non-nil.
+func mergeHostMetadataUpdates(existing map[string]*proto.HostMetadataUpdate, latest map[string]any) {
+	if latest == nil {
+		return
+	}
+
+	for k, v := range latest {
+		switch update := v.(type) {
+		case *proto.HostMetadataUpdate:
+			existing[k] = update
+		case *proto.HostMetadataRemove:
+			delete(existing, k)
+		}
+	}
+}
+
+// OnRouteUpdate should be used to update the internal state of routing tables
+func (kp *KubeProxy) OnRouteUpdate(k routes.KeyInterface, v routes.ValueInterface) {
+	log.WithFields(log.Fields{"key": k, "value": v}).Debug("kube-proxy: OnRouteUpdate")
+	kp.rt.Update(k, v)
+}
+
 // OnRouteDelete should be used to update the internal state of routing tables
-func (kp *KubeProxy) OnRouteDelete(k routes.Key) {
-	_ = kp.rt.Delete(k)
+func (kp *KubeProxy) OnRouteDelete(k routes.KeyInterface) {
+	kp.rt.Delete(k)
 	log.WithField("key", k).Debug("kube-proxy: OnRouteDelete")
 }
 
@@ -250,12 +404,22 @@ func (kp *KubeProxy) ConntrackFrontendHasBackend(ip net.IP, port uint16, backend
 	backendPort uint16, proto uint8) bool {
 
 	// Thanks to holding the lock since ConntrackScanStart, this condition holds for the
-	// whole iteration. So if we started without syncer, we willalso finish without it.
+	// whole iteration. So if we started without syncer, we will also finish without it.
 	// And if we had a syncer, we will have the same until the end.
-	if kp.syncer != nil {
+	if kp.syncer != nil && kp.syncer.HasSynced() {
 		return kp.syncer.ConntrackFrontendHasBackend(ip, port, backendIP, backendPort, proto)
 	}
 
 	// We cannot say yet, so do not break anything
 	return true
+}
+
+// ConntrackDestIsService to satisfy conntrack.NATChecker - forwards to syncer.
+func (kp *KubeProxy) ConntrackDestIsService(ip net.IP, port uint16, proto uint8) bool {
+	if kp.syncer != nil && kp.syncer.HasSynced() {
+		return kp.syncer.ConntrackDestIsService(ip, port, proto)
+	}
+
+	// We cannot say yet, so do not break anything
+	return false
 }

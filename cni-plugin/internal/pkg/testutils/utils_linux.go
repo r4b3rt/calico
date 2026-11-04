@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2020 Tigera, Inc. All rights reserved.
+// Copyright (c) 2015-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,25 +32,18 @@ import (
 	cniv1 "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/containernetworking/plugins/pkg/testutils"
+	"github.com/google/uuid"
 	je "github.com/juju/errors"
 	"github.com/mcuadros/go-version"
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega/gexec"
+	log "github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 
 	k8sconversion "github.com/projectcalico/calico/libcalico-go/lib/backend/k8s/conversion"
 	"github.com/projectcalico/calico/libcalico-go/lib/names"
-
-	uuid "github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
-	"github.com/vishvananda/netlink"
+	"github.com/projectcalico/calico/libcalico-go/lib/netlinkutils"
 )
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 // GetResultForCurrent takes the output with cniVersion and returns the Result in cniv1.Result format.
 func GetResultForCurrent(session *gexec.Session, cniVersion string) (*cniv1.Result, error) {
@@ -213,6 +206,27 @@ func RunCNIPluginWithId(
 	contRoutes []netlink.Route,
 	err error,
 ) {
+	return RunCNIPluginWithIdContext(context.Background(), netconf, podName, podNamespace, ip, containerId, ifName, targetNs)
+}
+
+// RunCNIPluginWithIdContext is RunCNIPluginWithId with a context that, when canceled, kills
+// the plugin process the way a container runtime does when its request deadline passes.
+func RunCNIPluginWithIdContext(
+	ctx context.Context,
+	netconf,
+	podName,
+	podNamespace,
+	ip,
+	containerId,
+	ifName string,
+	targetNs ns.NetNS,
+) (
+	result *cniv1.Result,
+	contVeth netlink.Link,
+	contAddr []netlink.Addr,
+	contRoutes []netlink.Route,
+	err error,
+) {
 	// Set up the env for running the CNI plugin
 	k8sEnv := ""
 	if podName != "" {
@@ -248,7 +262,7 @@ func RunCNIPluginWithId(
 	log.Debugf("Calling CNI plugin with the following env vars: %v", env)
 	var r types.Result
 	pluginPath := fmt.Sprintf("%s/%s", os.Getenv("BIN"), os.Getenv("PLUGIN"))
-	r, err = invoke.ExecPluginWithResult(context.Background(), pluginPath, []byte(netconf), args, customExec)
+	r, err = invoke.ExecPluginWithResult(ctx, pluginPath, []byte(netconf), args, customExec)
 	if err != nil {
 		log.Debugf("config is: %s", netconf)
 		err = je.Trace(err)
@@ -289,16 +303,26 @@ func RunCNIPluginWithId(
 	}
 
 	err = targetNs.Do(func(_ ns.NetNS) error {
-		contVeth, err = netlink.LinkByName(ifName)
+		nlHandle, err := netlink.NewHandle(syscall.NETLINK_ROUTE)
 		if err != nil {
 			return err
 		}
 
-		contAddr, err = netlink.AddrList(contVeth, syscall.AF_INET)
+		defer func() {
+			if err := nlHandle.Close(); err != nil {
+				log.WithError(err).Warn("Failed to close netlink handle")
+			}
+		}()
+		contVeth, err = nlHandle.LinkByName(ifName)
 		if err != nil {
 			return err
 		}
-		v6Addrs, err := netlink.AddrList(contVeth, syscall.AF_INET6)
+
+		contAddr, err = netlinkutils.AddrListRetryEINTR(nlHandle, contVeth, syscall.AF_INET)
+		if err != nil {
+			return err
+		}
+		v6Addrs, err := netlinkutils.AddrListRetryEINTR(nlHandle, contVeth, syscall.AF_INET6)
 		if err != nil {
 			return err
 		}
@@ -309,7 +333,7 @@ func RunCNIPluginWithId(
 			}
 		}
 
-		contRoutes, err = netlink.RouteList(contVeth, syscall.AF_INET)
+		contRoutes, err = netlinkutils.RouteListRetryEINTR(nlHandle, contVeth, syscall.AF_INET)
 		if err != nil {
 			return err
 		}
@@ -430,7 +454,7 @@ func DeleteContainerWithIdAndIfaceName(netconf, netnspath, podName, podNamespace
 }
 
 func Cmd(cmd string) string {
-	_, _ = ginkgo.GinkgoWriter.Write([]byte(fmt.Sprintf("Running command [%s]\n", cmd)))
+	_, _ = fmt.Fprintf(ginkgo.GinkgoWriter, "Running command [%s]\n", cmd)
 	out, err := exec.Command("bash", "-c", cmd).Output()
 	if err != nil {
 		_, writeErr := ginkgo.GinkgoWriter.Write(out)
@@ -476,7 +500,7 @@ func CheckSysctlValue(sysctlPath, value string) error {
 
 // Convert the netns name to a container ID.
 func netnsToContainerID(netns string) string {
-	u := uuid.NewV5(uuid.NamespaceURL, netns)
+	u := uuid.NewSHA1(uuid.NameSpaceURL, []byte(netns))
 	buf := make([]byte, 10)
 	hex.Encode(buf, u[0:5])
 	return string(buf)
